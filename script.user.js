@@ -3,6 +3,8 @@
 // @namespace    http://tampermonkey.net/
 // @version      21.2
 // @description  Combined autofill with load-on-demand RadComboBox support, Division checkboxes, Insurance Carrier, Claim/Policy, Loss Description
+// @updateURL    https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
+// @downloadURL  https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
 // @match        https://workcenter-sp.servpronet.io/intake*
 // @match        https://servpro.ngsapps.net/Enterprise/Module/Job/CreateJob.aspx*
 // @grant        none
