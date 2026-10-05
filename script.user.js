@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WorkCenter + CreateJob Intake Autofill (Phase 21.2)
 // @namespace    http://tampermonkey.net/
-// @version      21.2
+// @version      21.3
 // @description  Combined autofill with load-on-demand RadComboBox support, Division checkboxes, Insurance Carrier, Claim/Policy, Loss Description
 // @updateURL    https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
 // @downloadURL  https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
@@ -711,6 +711,44 @@ function setPlainTextBox(id, value) {
         }
     }
 
+    // Dedicated setter for the Project Notes textarea (#journalNote).
+    // injectKO's generic 'value' observableName never matches the real KO property
+    // (RMLead().LossNote), so the underlying observable was never actually updated -
+    // only the textarea's visible DOM value was set, which the framework then
+    // overwrote. This walks the KO context and commits the value directly.
+    function setJournalNote(value) {
+        if (!value) return;
+        let el = document.getElementById('journalNote');
+        if (!el) return;
+
+        let committed = false;
+        if (window.ko) {
+            try {
+                let context = window.ko.contextFor(el);
+                let vm = context ? (context.$data || context.$root) : null;
+                if (vm && typeof vm.RMLead === 'function') {
+                    let lead = vm.RMLead();
+                    if (lead && typeof lead.LossNote === 'function') {
+                        lead.LossNote(value);
+                        committed = true;
+                    }
+                }
+            } catch (e) {
+                console.log("setJournalNote KO update failed:", e.message);
+            }
+        }
+
+        el.value = value;
+        if (window.jQuery) window.jQuery(el).val(value);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+
+        console.log(committed
+            ? `✓ Set journalNote (Project Notes, KO-committed) → ${value}`
+            : `⚠ Set journalNote (DOM only, KO commit failed) → ${value}`);
+    }
+
     // PREDICATE KENDO ENGINE - Zero Mathematical Offsets (WorkCenter)
     function setKendoDropdownExact(elementId, text) {
         if (!window.jQuery || !text) return;
@@ -1205,6 +1243,12 @@ function setPlainTextBox(id, value) {
             lossAddressRaw = billingAddressRaw;
         }
 
+        // Determine whether Billing Address should mirror the Loss Address.
+        // Drives the "Same as Caller" (Customer) -> "Same as Customer" (Loss Address) sequence below.
+        const billingSameAsLossAddress = billingAddressRaw.toLowerCase().includes("same as loss") || billingAddressRaw.trim() === "";
+
+
+
         let reportedBy = mapReportedBy(reportedByRaw);
         // Commercial: if no clean match, default to Facility Manager rather than Other
         if (propertyType.toLowerCase().includes('com') && reportedBy === "Other") {
@@ -1232,7 +1276,7 @@ function setPlainTextBox(id, value) {
         setTimeout(() => {
             let prefix = propertyType ? propertyType.substring(0,3).toUpperCase() : "";
             let customNote = prefix && typeOfLoss ? `${prefix}/${typeOfLoss}` : (prefix || typeOfLoss || "");
-            injectKO('#journalNote', customNote, 'value');
+            setJournalNote(customNote);
 
             let parsedAddress = parseAddress(lossAddressRaw);
             if (parsedAddress.street && parsedAddress.city) {
@@ -1507,35 +1551,58 @@ function setPlainTextBox(id, value) {
         }, 300);
         setTimeout(() => clearInterval(contactDialogInterval), 25000);
 
-        // Watcher C: "Same as Caller" Auto-Kicker
-        // Delay the start of this watcher by 5 seconds to ensure the Caller modal has been completely processed and closed.
-        setTimeout(() => {
-            let sameAsCallerInterval = setInterval(() => {
-                let contactDialog = document.getElementById("addEditContactDialog");
-                let callerInput = document.getElementById("autoCompleteCallerContact");
+        // Watcher C: "Same as Caller" -> "Same as Customer" Auto-Kicker
+        // Only runs when Billing Address indicates it matches the Loss Address.
+        // Sequence MUST be: wait for Caller to be fully saved -> click "Same as Caller" (Customer)
+        // -> then click "Same as Customer" (Loss Address).
+        if (billingSameAsLossAddress) {
+            // Delay the start of this watcher by 5 seconds to ensure the Caller modal has been completely processed and closed.
+            setTimeout(() => {
+                let sameAsCallerInterval = setInterval(() => {
+                    let contactDialog = document.getElementById("addEditContactDialog");
+                    let callerInput = document.getElementById("autoCompleteCallerContact");
 
-                // Only proceed if the dialog is NOT open AND the Caller input actually has text
-                let isModalOpen = contactDialog && window.jQuery(contactDialog).is(":visible");
-                let isCallerFilled = callerInput && callerInput.value.trim() !== "";
+                    let isModalOpen = contactDialog && window.jQuery(contactDialog).is(":visible");
+                    let isCallerFilled = callerInput && callerInput.value.trim() !== "";
 
-                if (!isModalOpen && isCallerFilled) {
-                    let sameAsBtn = document.querySelector("button[data-bind*='sameAsCallerClick']");
-                    if (sameAsBtn && sameAsBtn.offsetParent !== null) { // Element is visible on screen
-                        let koContext = window.ko && window.ko.contextFor ? window.ko.contextFor(sameAsBtn) : null;
-                        if (koContext && koContext.$parent && typeof koContext.$parent.sameAsCallerClick === 'function') {
-                            koContext.$parent.sameAsCallerClick();
-                        } else {
-                            sameAsBtn.click();
+                    if (!isModalOpen && isCallerFilled) {
+                        // Precise selector: Customer's "Same as Caller" data-bind ENDS WITH "sameAsCallerClick".
+                        // Occupant's ends with "sameAsCallerClickOccupant" and will NOT match $=.
+                        let sameAsCallerBtn = document.querySelector("button[data-bind$='sameAsCallerClick']");
+                        if (sameAsCallerBtn && sameAsCallerBtn.offsetParent !== null) {
+                            let koContext = window.ko && window.ko.contextFor ? window.ko.contextFor(sameAsCallerBtn) : null;
+                            if (koContext && koContext.$parent && typeof koContext.$parent.sameAsCallerClick === 'function') {
+                                koContext.$parent.sameAsCallerClick();
+                            } else {
+                                sameAsCallerBtn.click();
+                            }
+                            console.log("✓ Clicked 'Same as Caller' (Customer)");
+                            clearInterval(sameAsCallerInterval);
+
+                            // Chase "Same as Customer" under Loss Address once Customer has settled.
+                            setTimeout(() => {
+                                let sameAsCustomerLossInterval = setInterval(() => {
+                                    let sameAsCustomerLossBtn = document.querySelector("button[data-bind*='sameAsCustomerClickLossAddress']");
+                                    if (sameAsCustomerLossBtn && sameAsCustomerLossBtn.offsetParent !== null) {
+                                        let lossKoContext = window.ko && window.ko.contextFor ? window.ko.contextFor(sameAsCustomerLossBtn) : null;
+                                        if (lossKoContext && lossKoContext.$parent && typeof lossKoContext.$parent.sameAsCustomerClickLossAddress === 'function') {
+                                            lossKoContext.$parent.sameAsCustomerClickLossAddress();
+                                        } else {
+                                            sameAsCustomerLossBtn.click();
+                                        }
+                                        console.log("✓ Clicked 'Same as Customer' (Loss Address)");
+                                        clearInterval(sameAsCustomerLossInterval);
+                                    }
+                                }, 500);
+                                setTimeout(() => clearInterval(sameAsCustomerLossInterval), 10000);
+                            }, 800);
                         }
-                        console.log("✓ Clicked 'Same as Caller'");
-                        clearInterval(sameAsCallerInterval);
                     }
-                }
-            }, 500);
+                }, 500);
 
-            // Give up after 20 seconds
-            setTimeout(() => clearInterval(sameAsCallerInterval), 20000);
-        }, 5000); // 5-second initial delay guarantees it waits for Step 6 and Watcher B to finish
+                setTimeout(() => clearInterval(sameAsCallerInterval), 20000);
+            }, 5000);
+        }
     }
 
     // ==========================================
