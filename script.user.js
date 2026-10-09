@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         WorkCenter + CreateJob Intake Autofill (Phase 21.2)
+// @name         WorkCenter + CreateJob Intake Autofill
 // @namespace    http://tampermonkey.net/
-// @version      21.3
+// @version      22.00
 // @description  Combined autofill with load-on-demand RadComboBox support, Division checkboxes, Insurance Carrier, Claim/Policy, Loss Description
 // @updateURL    https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
 // @downloadURL  https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
@@ -346,7 +346,7 @@ async function findEstimatorMatch(scheduledPMRaw) {
     CompanyLossFirstName: "ctl00_ContentPlaceHolder1_JobParentInformation_RadTextBox_NewContactForOfficeFirstName",
     CompanyLossLastName:  "ctl00_ContentPlaceHolder1_JobParentInformation_RadTextBox_NewContactForOfficeLastName",
     CompanyAddressLoss:   "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_CompanyAddressLoss_Input",
-    CompanyZipLoss:       "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_CompanyCityLoss",
+    CompanyZipLoss:       "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_CompanyZipLoss",
     CompanyCityLoss:      "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_CompanyCityLoss",
     CompanyStateLoss:     "ctl00_ContentPlaceHolder1_JobParentInformation_DropDown_CompanyStateLoss",
     CompanyMainPhoneLoss: "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_CompanyMainPhoneLoss",
@@ -496,7 +496,37 @@ async function findEstimatorMatch(scheduledPMRaw) {
     // ==========================================
     //  SHARED HELPER FUNCTIONS
     // ==========================================
+
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
     // Plain RadInput textbox setter (for First/Last/Email/Zip/City)
+    // Zip -> wait for the page's zip lookup -> THEN city + state
+    // ids = { zip, city, state } (CJ keys' element ids), parsed = parseAddress() result
+    async function fillZipCityState(ids, parsed) {
+        const stEl = document.getElementById(ids.state);
+        const stateVal = () => { const c = stEl && getCurrentDropdownValue(stEl); return (c && c.value) || ""; };
+        let lookupDone = false;
+
+        if (parsed.zip) {
+            const before = stateVal();
+            setPlainTextBox(ids.zip, parsed.zip);   // fires the page's own zip lookup
+            let kicked = false;
+            const start = Date.now();
+            while (Date.now() - start < 3000) {
+                await sleep(250);
+                if (stateVal() && stateVal() !== before) { lookupDone = true; break; }
+                if (!kicked && Date.now() - start > 1200) { triggerZipBind(ids.zip); kicked = true; }
+            }
+            console.log(`Zip ${parsed.zip}: page lookup ${lookupDone ? "populated" : "did NOT change"} state (${ids.state.split('_').pop()})`);
+        }
+
+        if (parsed.city) setPlainTextBox(ids.city, parsed.city);
+
+        // Trust the page's zip lookup if it filled the state; only set it ourselves otherwise
+        if (parsed.state && stEl && !lookupDone) {
+            setRadComboByText(stEl, parsed.state, true);
+        }
+    }
+
 function setPlainTextBox(id, value) {
         if (!value) return;
         let el = document.getElementById(id);
@@ -609,47 +639,63 @@ function setPlainTextBox(id, value) {
     }
 
     // Phase 19+ address parser (state+zip extracted together to avoid matching house numbers)
+    const US_STATE_CODES = new Set(["AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"]);
+
     function parseAddress(raw) {
-        let result = { street: "", city: "", state: "", zip: "" };
-        if (!raw) return result;
+    let result = { street: "", city: "", state: "", zip: "" };
+    if (!raw) return result;
 
-        // Extract state + zip together - the zip MUST immediately follow the state code.
-        let stateZipMatch = raw.match(/\b([A-Z]{2})\s+(\d{5})(?:-\d{4})?\b/i);
-        let cleanStr = raw;
+    let cleanStr = raw.replace(/[,\s]*\b(USA|US|United States)\b\.?\s*$/i, "").trim();
 
-        if (stateZipMatch) {
-            result.state = stateZipMatch[1].toUpperCase();
-            result.zip = stateZipMatch[2];
-            cleanStr = cleanStr.slice(0, stateZipMatch.index) + cleanStr.slice(stateZipMatch.index + stateZipMatch[0].length);
-        }
-
-        cleanStr = cleanStr.replace(/,\s*$/, "").trim();
-
-        if (cleanStr.includes(',')) {
-            let parts = cleanStr.split(',').map(p => p.trim());
-            result.street = parts[0];
-            result.city = parts[1] || "";
-        } else {
-            let suffixes = ['street', 'avenue', 'road', 'boulevard', 'drive', 'lane', 'court', 'place', 'terrace', 'parkway', 'pike', 'highway', 'way'];
-            let words = cleanStr.split(/\s+/);
-
-            let splitIndex = -1;
-            for (let i = words.length - 1; i >= 0; i--) {
-                let word = words[i].toLowerCase().replace(/\.$/, '');
-                if (suffixes.includes(word)) { splitIndex = i; break; }
-            }
-
-            if (splitIndex !== -1 && splitIndex < words.length - 1) {
-                result.street = words.slice(0, splitIndex + 1).join(' ').trim();
-                result.city = words.slice(splitIndex + 1).join(' ').trim();
-            } else {
-                result.city = words.pop().trim();
-                result.street = words.join(' ').trim();
-            }
-        }
-
-        return result;
+    // 1. State + zip together; take the LAST match whose state code is a real US state
+    let re = /\b([A-Za-z]{2})\.?,?\s+(\d{5})(?:-\d{4})?\b/g, m, found = null;
+    while ((m = re.exec(cleanStr)) !== null) {
+        if (US_STATE_CODES.has(m[1].toUpperCase())) found = m;
     }
+    if (found) {
+        result.state = found[1].toUpperCase();
+        result.zip = found[2];
+        cleanStr = cleanStr.slice(0, found.index) + cleanStr.slice(found.index + found[0].length);
+    } else {
+        // 2. Fallback: a trailing 5-digit zip with no state ("Richmond, 23220")
+        let zipOnly = cleanStr.match(/[,\s]+(\d{5})(?:-\d{4})?\s*$/);
+        if (zipOnly) {
+            result.zip = zipOnly[1];
+            cleanStr = cleanStr.slice(0, zipOnly.index);
+        }
+        // 3. State alone at the end ("Richmond VA")
+        let stateOnly = cleanStr.match(/[,\s]+([A-Z]{2})\.?\s*$/);
+        if (stateOnly && US_STATE_CODES.has(stateOnly[1].toUpperCase())) {
+            result.state = stateOnly[1].toUpperCase();
+            cleanStr = cleanStr.slice(0, stateOnly.index);
+        }
+    }
+
+    cleanStr = cleanStr.replace(/[,\s]+$/, "").trim();
+
+    // ---- street / city split (unchanged from your version) ----
+    if (cleanStr.includes(',')) {
+        let parts = cleanStr.split(',').map(p => p.trim());
+        result.street = parts[0];
+        result.city = parts[1] || "";
+    } else {
+        let suffixes = ['street','avenue','road','boulevard','drive','lane','court','place','terrace','parkway','pike','highway','way'];
+        let words = cleanStr.split(/\s+/);
+        let splitIndex = -1;
+        for (let i = words.length - 1; i >= 0; i--) {
+            let word = words[i].toLowerCase().replace(/\.$/, '');
+            if (suffixes.includes(word)) { splitIndex = i; break; }
+        }
+        if (splitIndex !== -1 && splitIndex < words.length - 1) {
+            result.street = words.slice(0, splitIndex + 1).join(' ').trim();
+            result.city = words.slice(splitIndex + 1).join(' ').trim();
+        } else {
+            result.city = words.pop().trim();
+            result.street = words.join(' ').trim();
+        }
+    }
+    return result;
+}
 
     // Comprehensive Fallback Resolver for Franchise
     function resolveFranchise(zip, city, envCode) {
@@ -709,6 +755,58 @@ function setPlainTextBox(id, value) {
             window.jQuery(el).val(value);
             el.dispatchEvent(new Event('input', { bubbles: true }));
         }
+    }
+
+        // Commits a value to the KO observable bound to the element (reads its data-bind), then fires DOM events.
+    function setKOValue(selector, value, verify = false) {
+        if (value === undefined || value === null || value === "") return false;
+        const el = document.querySelector(selector);
+        if (!el) { console.log(`✗ setKOValue: ${selector} not found`); return false; }
+
+        const commit = () => {
+            let committed = false;
+            if (window.ko) {
+                try {
+                    const bind = el.getAttribute('data-bind') || "";
+                    let expr = null;
+                    if (window.ko.expressionRewriting && window.ko.expressionRewriting.parseObjectLiteral) {
+                        const pairs = window.ko.expressionRewriting.parseObjectLiteral(bind);
+                        const p = pairs.find(x => x.key === 'value' || x.key === 'textInput');
+                        if (p) expr = p.value;
+                    }
+                    if (!expr) {
+                        const m = bind.match(/(?:textInput|value)\s*:\s*([^,]+)/);
+                        if (m) expr = m[1].trim();
+                    }
+                    if (expr) {
+                        const ctx = window.ko.contextFor(el);
+                        const target = new Function('$context', 'with($context){with($data||{}){return (' + expr + ');}}')(ctx);
+                        if (window.ko.isWriteableObservable(target)) { target(value); committed = true; }
+                    }
+                } catch (e) {
+                    console.log(`setKOValue KO commit failed for ${selector}:`, e.message);
+                }
+            }
+            el.value = value;
+            if (window.jQuery) window.jQuery(el).val(value);
+            el.dispatchEvent(new Event('input',  { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur',   { bubbles: true }));
+            return committed;
+        };
+
+        const committed = commit();
+        console.log(committed ? `✓ KO-committed ${selector} → ${value}` : `⚠ DOM-only ${selector} → ${value}`);
+
+        if (verify) {
+            setTimeout(() => {
+                if (el.value !== String(value)) {
+                    console.log(`↻ ${selector} was reset to "${el.value}" - re-applying`);
+                    commit();
+                }
+            }, 1200);
+        }
+        return committed;
     }
 
     // Dedicated setter for the Project Notes textarea (#journalNote).
@@ -954,11 +1052,11 @@ function setPlainTextBox(id, value) {
     function triggerZipBind(zipFieldId) {
         let el = document.getElementById(zipFieldId);
         if (!el) return;
-        // Fire the inline onblur handler the page attached (BindIndividual[Loss]CountryStateByZip)
         if (typeof el.onblur === 'function') {
             try { el.onblur(); } catch (e) {}
+        } else {
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
         }
-        el.dispatchEvent(new Event('blur', { bubbles: true }));
     }
 
     function isCompensationPlanDropdown(comboBoxElement) {
@@ -1052,6 +1150,7 @@ function setPlainTextBox(id, value) {
             let itemText = (item.get_text() || "").toLowerCase().trim();
             if (itemText === target) return item;
         }
+        if (target.length <= 2) return null;   // never fuzzy-match 2-letter codes ("va" matches "Nevada")
         // fuzzy match (substring either direction)
         for (let i = 0; i < count; i++) {
             let item = items.getItem(i);
@@ -1196,25 +1295,63 @@ function setPlainTextBox(id, value) {
         }
     }
 
-    // Word-match Cause of Loss against the Source of Loss option list
-    function matchSourceOfLoss(causeOfLossRaw) {
-        if (!causeOfLossRaw) return null;
-        let causeWords = causeOfLossRaw.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
-        let bestOption = null, bestScore = 0;
+ // Word-boundary Cause of Loss -> Source of Loss matcher
+function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
+    const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    const text = norm(causeOfLossRaw);
+    const typeLower = (typeOfLossRaw || "").toLowerCase();
 
-        for (let option of sourceOfLossOptions) {
-            let optWords = option.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
-            let score = 0;
-            for (let cw of causeWords) {
-                for (let ow of optWords) {
-                    if (cw === ow) { score += 2; }
-                    else if (cw.length >= 4 && ow.length >= 4 && (cw.includes(ow) || ow.includes(cw))) { score += 1; }
-                }
-            }
-            if (score > bestScore) { bestScore = score; bestOption = option; }
-        }
-        return bestScore > 0 ? bestOption : null;
+    // Duct cleaning jobs are the one place HVAC is a safe default
+    if (typeLower.includes("duct")) return "HVAC";
+    if (!text) return null;
+
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const wordRe = phrase => new RegExp('\\b' + esc(phrase).replace(/\s+/g, '\\s+') + 's?\\b');
+
+    // 1. Explicit synonyms (word-boundary regexes, most specific first)
+    const synonyms = [
+        [/\b(air\s*)?duct(work|s)?\b|\bduct cleaning\b/, "HVAC"],
+        [/\bdryer vent\b/, "Dryer Vent"],
+        [/\b(hvac|a\s?c|air conditioning)\b/, "HVAC"],
+        [/\b(burst|broken|busted)\s+pipe\b|\bpipe\s+(burst|broke)/, "Pipe Break"],
+        [/\bfrozen\s+pipe/, "Frozen Pipe Burst"],
+        [/\bsewage\b|\bsewer\b/, "Sewer"],
+        [/\bwasher\b/, "Washing Machine"],
+        [/\bwater heater\b|\bhot water tank\b/, "Water Heater"],
+        [/\bsump\b/, "Sump Pump Failure"]
+    ];
+    for (let [re, opt] of synonyms) {
+        if (re.test(text)) return opt;
     }
+
+    // 2. Full option phrase found as whole words (longest option first)
+    const skip = new Set(["other", "unknown"]);
+    const byLength = [...sourceOfLossOptions]
+        .filter(o => !skip.has(o.toLowerCase()))
+        .sort((a, b) => b.length - a.length);
+    for (let opt of byLength) {
+        if (wordRe(norm(opt)).test(text)) return opt;
+    }
+
+    // 3. Strict word coverage: >=60% of the option's words present, with at least one non-generic word
+    const stop = new Set(["the","a","an","of","from","to","and","in","on","it","is","was","has","been","yes","no","not","resolved","unknown"]);
+    const generic = new Set(["water","leak","line","supply","drain","system","pipe","unit"]);
+    const stem = w => w.replace(/s$/, '');
+    const textWords = new Set(text.split(' ').filter(w => w && !stop.has(w)).map(stem));
+
+    let best = null, bestCoverage = 0, bestHits = 0;
+    for (let opt of sourceOfLossOptions) {
+        if (skip.has(opt.toLowerCase())) continue;
+        const optWords = norm(opt).split(' ').filter(Boolean).map(stem);
+        const hits = optWords.filter(w => textWords.has(w));
+        if (!hits.length || hits.every(w => generic.has(w))) continue;
+        const coverage = hits.length / optWords.length;
+        if (coverage >= 0.6 && (coverage > bestCoverage || (coverage === bestCoverage && hits.length > bestHits))) {
+            best = opt; bestCoverage = coverage; bestHits = hits.length;
+        }
+    }
+    return best;
+}
 
     // ==========================================
     //  WORKCENTER (intake) AUTOFILL
@@ -1279,12 +1416,19 @@ function setPlainTextBox(id, value) {
             setJournalNote(customNote);
 
             let parsedAddress = parseAddress(lossAddressRaw);
-            if (parsedAddress.street && parsedAddress.city) {
-                injectKO('#customerAddress1', parsedAddress.street, 'value');
-                injectKO('#callerCity', parsedAddress.city, 'value');
-                injectKO('#callerPostalCode', parsedAddress.zip, 'value');
-                setKendoDropdownExact('callerState', parsedAddress.state);
+            console.log("WC parsed loss address:", parsedAddress);
 
+            // Address block runs on its own so the zip-lookup wait doesn't delay the rest of this step
+            (async () => {
+                setKOValue('#customerAddress1', parsedAddress.street);
+                setKOValue('#callerPostalCode', parsedAddress.zip, true);
+                await sleep(700);   // let any zip-triggered lookup finish before city/state
+                setKOValue('#callerCity', parsedAddress.city, true);
+                setKendoDropdownExact('callerState', parsedAddress.state);
+            })();
+
+            // Franchise no longer depends on BOTH street and city parsing successfully
+            if (parsedAddress.zip || parsedAddress.city) {
                 let franchiseKey = resolveFranchise(parsedAddress.zip, parsedAddress.city, data[COLUMN.EnvironmentalCode]);
                 if (franchiseKey) {
                     let translatedFranchiseName = franchiseNameTranslation[franchiseKey] || franchiseKey;
@@ -1683,15 +1827,7 @@ let reportedBy = mapReportedBy(reportedByRaw);
             setPlainTextBox(CJ.CompanyEmail, email);
             setMaskedPhone(CJ.CompanyMainPhone, phone);
             if (custAddr.street) setSearchBoxAddress(CJ.CompanyAddress, custAddr.street);
-            if (custAddr.zip) {
-                setPlainTextBox(CJ.CompanyZip, custAddr.zip);
-                triggerZipBind(CJ.CompanyZip);
-            }
-            if (custAddr.city) setPlainTextBox(CJ.CompanyCity, custAddr.city);
-            if (custAddr.state) {
-                let stEl = document.getElementById(CJ.CompanyState);
-                if (stEl) setRadComboByText(stEl, custAddr.state, true);
-            }
+            await fillZipCityState({ zip: CJ.CompanyZip, city: CJ.CompanyCity, state: CJ.CompanyState }, custAddr);
 
             // Contact Person under Customer As Company (POC)
             setPlainTextBox(CJ.CCFirstName, custFirst);
@@ -1716,15 +1852,7 @@ let reportedBy = mapReportedBy(reportedByRaw);
                 setPlainTextBox(CJ.CompanyLossLastName,  custLast);
                 setMaskedPhone(CJ.CompanyMainPhoneLoss, phone);
                 if (lossParsed.street) setSearchBoxAddress(CJ.CompanyAddressLoss, lossParsed.street);
-                if (lossParsed.zip) {
-                    setPlainTextBox(CJ.CompanyZipLoss, lossParsed.zip);
-                    triggerZipBind(CJ.CompanyZipLoss);
-                }
-                if (lossParsed.city) setPlainTextBox(CJ.CompanyCityLoss, lossParsed.city);
-                if (lossParsed.state) {
-                    let stEl = document.getElementById(CJ.CompanyStateLoss);
-                    if (stEl) setRadComboByText(stEl, lossParsed.state, true);
-                }
+                await fillZipCityState({ zip: CJ.CompanyZipLoss, city: CJ.CompanyCityLoss, state: CJ.CompanyStateLoss }, lossParsed);
             }
         } else {
             // ---- RESIDENTIAL: individual customer fill ----
@@ -1733,15 +1861,7 @@ let reportedBy = mapReportedBy(reportedByRaw);
             setPlainTextBox(CJ.CustEmail,     email);
             setMaskedPhone(CJ.CustMainPhone,  phone);
             if (custAddr.street) setSearchBoxAddress(CJ.CustAddress, custAddr.street);
-            if (custAddr.zip) {
-                setPlainTextBox(CJ.CustZip, custAddr.zip);
-                triggerZipBind(CJ.CustZip);
-            }
-            if (custAddr.city) setPlainTextBox(CJ.CustCity, custAddr.city);
-            if (custAddr.state) {
-                let custStateEl = document.getElementById(CJ.CustState);
-                if (custStateEl) setRadComboByText(custStateEl, custAddr.state, true);
-            }
+            await fillZipCityState({ zip: CJ.CustZip, city: CJ.CustCity, state: CJ.CustState }, custAddr);
 
             if (billingSame) {
                 await new Promise(r => setTimeout(r, 1000));
@@ -1757,15 +1877,7 @@ let reportedBy = mapReportedBy(reportedByRaw);
                 setPlainTextBox(CJ.LossLastName,  custLast);
                 setMaskedPhone(CJ.LossMainPhone,  phone);
                 if (lossParsed.street) setSearchBoxAddress(CJ.LossAddress, lossParsed.street);
-                if (lossParsed.zip) {
-                    setPlainTextBox(CJ.LossZip, lossParsed.zip);
-                    triggerZipBind(CJ.LossZip);
-                }
-                if (lossParsed.city) setPlainTextBox(CJ.LossCity, lossParsed.city);
-                if (lossParsed.state) {
-                    let lossStateEl = document.getElementById(CJ.LossState);
-                    if (lossStateEl) setRadComboByText(lossStateEl, lossParsed.state, true);
-                }
+                await fillZipCityState({ zip: CJ.LossZip, city: CJ.LossCity, state: CJ.LossState }, lossParsed);
             }
         }
 
@@ -1875,27 +1987,14 @@ let reportedBy = mapReportedBy(reportedByRaw);
         await new Promise(r => setTimeout(r, 500));
         await setLoadOnDemandCombo(CJ.SecondaryLossType, lossTypeInfo.secondary);
 
-        // 7. Source of Loss - preloaded; explicit synonyms first, then word-match, then "Other"
-        let sourceSynonyms = {
-            "duct cleaning": "HVAC",
-            "duct": "HVAC",
-            "hvac": "HVAC",
-            "air duct": "HVAC",
-            "vent": "HVAC"
-        };
-        let causeLower = (causeOfLoss || "").toLowerCase().trim();
-        let sourceMatch = null;
-        for (let key in sourceSynonyms) {
-            if (causeLower.includes(key)) { sourceMatch = sourceSynonyms[key]; break; }
-        }
-        if (!sourceMatch) sourceMatch = matchSourceOfLoss(causeOfLoss);   // existing generous word-matcher
-        if (!sourceMatch) sourceMatch = "Other";                          // fallback
+        // 7. Source of Loss - preloaded combo; word-boundary matcher, falls back to "Other"
+        let sourceMatch = matchSourceOfLoss(causeOfLoss, typeOfLoss) || "Other";
         console.log("Cause of Loss:", causeOfLoss, "-> Source of Loss:", sourceMatch);
         let sourceEl = document.getElementById(CJ.SourceOfLoss);
         if (sourceEl) {
             let ok = setRadComboByText(sourceEl, sourceMatch, true);
             if (!ok && sourceMatch !== "Other") {
-                setRadComboByText(sourceEl, "Other", true);   // if HVAC/match somehow missing, try Other
+                setRadComboByText(sourceEl, "Other", true);
             }
         }
 
