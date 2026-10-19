@@ -13,6 +13,8 @@
 (function() {
     'use strict';
 
+    const SCRIPT_VERSION = "23.05";   // keep in sync with @version above - shown in the panel header
+
     // ==========================================
     //  FIXED COLUMN INDICES (shared data key format)
     // ==========================================
@@ -511,7 +513,7 @@ async function findEstimatorMatch(scheduledPMRaw) {
     header.style.fontWeight = 'bold';
 
     const title = document.createElement('span');
-    title.innerText = 'Intake Autofill';
+    title.innerText = 'Intake Autofill v' + SCRIPT_VERSION;
 
     const closeBtn = document.createElement('span');
     closeBtn.innerHTML = '&times;';
@@ -1258,6 +1260,31 @@ function setPlainTextBox(id, value) {
         const ref = cleanValue(hqRefRaw).toLowerCase();
         if (ref && !/^(no|n|none|false|0)$/.test(ref)) return TPA_OPTIONS.HQ;
         return null;
+    }
+
+    // Select the TPA Company by text, wait for the page to settle, and pin the known item value if the control
+    // did not keep the selection. Runs from the CreateJob fill; also callable from the console:
+    //   IntakeAutofillDebug.fillTPACompany("Contractor Connection")
+    async function fillTPACompany(tpa) {
+        if (!tpa) return false;
+        const tpaEl = document.getElementById(CJ.TPACompany);
+        if (!tpaEl) { console.log("✗ TPA Company combo not found on this page (#" + CJ.TPACompany + ")"); return false; }
+        const shown = () => ((getCurrentDropdownValue(tpaEl) || {}).text || "").trim();
+        const matches = () => shown().toLowerCase() === tpa.toLowerCase();
+
+        let ok = await setLoadOnDemandCombo(CJ.TPACompany, tpa);
+        await sleep(1200);                       // let any selected-index handler / AJAX refresh settle
+        if (!matches()) {
+            const known = TPA_KNOWN_VALUES[tpa];
+            console.log(`↻ TPA Company shows "${shown()}" after lookup (lookup ok=${ok})` + (known ? ` - pinning known value ${known}` : " - no known value to pin"));
+            if (known) {
+                setDropdownValue(tpaEl, known, tpa, true);
+                await sleep(800);
+            }
+        }
+        ok = matches();
+        console.log(ok ? `✓ TPA Company -> "${tpa}"` : `✗ TPA Company "${tpa}" could not be set (control shows "${shown()}")`);
+        return ok;
     }
 
     // --- Referred By mapping (shared) ---
@@ -2393,18 +2420,7 @@ if (scheduledPM !== "**NOT ASSIGNED**") {
         // 9b. TPA Company (Alacrity / Westhill / SERVPRO HQ / Contractor Connection) from "How did you hear about SERVPRO?"
         const tpa = mapTPA(referredByRaw, data[COLUMN.ServproHQRef]);
         console.log("TPA Company:", referredByRaw, "->", tpa);
-        if (tpa) {
-            let tpaOk = await setLoadOnDemandCombo(CJ.TPACompany, tpa);
-            if (!tpaOk && TPA_KNOWN_VALUES[tpa]) {
-                let tpaEl = document.getElementById(CJ.TPACompany);
-                if (tpaEl) {
-                    setDropdownValue(tpaEl, TPA_KNOWN_VALUES[tpa], tpa, true);
-                    console.log(`✓ TPA Company set via known value (${tpa} / ${TPA_KNOWN_VALUES[tpa]})`);
-                    tpaOk = true;
-                }
-            }
-            if (!tpaOk) console.log(`✗ TPA Company "${tpa}" not found in the list - add its exact text to TPA_OPTIONS or its value to TPA_KNOWN_VALUES`);
-        }
+        if (tpa) await fillTPACompany(tpa);
 
         // 10. Policy Information: ONLY Claim Number + Policy Number
         if (claimNum) setRadTextBoxValue(CJ.ClaimNumber, claimNum);
@@ -2473,7 +2489,8 @@ if (scheduledPM !== "**NOT ASSIGNED**") {
     window.IntakeAutofillDebug = {
         parseAddress, splitName, extractPhone, extractEmail, parseDataDate, excelDateToJSDate, parseDataKey, cleanValue,
         resolveAddressPair, resolveFranchise, stateCandidates, matchSourceOfLoss, lookupByKeyword, lossTypeMap, divisionMap,
-        mapReportedBy, mapReportedByCreateJob, mapReferredBy, mapReferredByCreateJob, mapTPA,
+        mapReportedBy, mapReportedByCreateJob, mapReferredBy, mapReferredByCreateJob, mapTPA, fillTPACompany,
+        setLoadOnDemandCombo, getCurrentDropdownValue, SCRIPT_VERSION,
         matchWorkCenterCauseOfLoss, wcCauseListFor, WC_CAUSE_OF_LOSS
     };
 })();
