@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WorkCenter + CreateJob Intake Autofill
 // @namespace    http://tampermonkey.net/
-// @version      22.00
-// @description  Combined autofill with load-on-demand RadComboBox support, Division checkboxes, Insurance Carrier, Claim/Policy, Loss Description
+// @version      23.05
+// @description  Combined autofill with load-on-demand RadComboBox support, Division checkboxes, Insurance Carrier, Claim/Policy, Loss Description, robust address/name/phone/date parsing
 // @updateURL    https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
 // @downloadURL  https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
 // @match        https://workcenter-sp.servpronet.io/intake*
@@ -82,25 +82,6 @@ async function fetchEstimatorBatch(text) {
     return (payload && payload.Items) || [];
 }
 
-    async function fetchCustomerBatch(text) {
-    const res = await fetch("https://servpro.ngsapps.net/Enterprise/Module/Services/DropDownsService.asmx/GetCustomerMultiColumn", {
-        headers: {
-            "accept": "*/*",
-            "content-type": "application/json; charset=UTF-8",
-            "x-requested-with": "XMLHttpRequest"
-        },
-        referrer: location.href,
-        body: JSON.stringify({ context: { Text: text, NumberOfItems: 0 } }),
-        method: "POST",
-        mode: "cors",
-        credentials: "include"
-    });
-    const json = await res.json();
-    let payload = json.d;
-    if (typeof payload === "string") payload = JSON.parse(payload);
-    return (payload && payload.Items) || [];
-}
-
     async function fetchCompanyCustomerBatch(text) {
     try {
         const res = await fetch("https://servpro.ngsapps.net/Enterprise/Module/Services/DropDownsService.asmx/GetCompanyCustomerMultiColumn", {
@@ -136,46 +117,15 @@ async function findCompanyCustomerByAddress(parsedAddr) {
     return null;
 }
 
-// Find an existing customer whose address matches the parsed billing/loss address.
-// Returns the matching item { Text, Value, Attributes } or null.
-async function findCustomerByAddress(parsedAddr) {
-    let street = (parsedAddr.street || "").toLowerCase().trim();
-    let zip = (parsedAddr.zip || "").trim();
-    if (!street) return null;
-
-    // Search by the full street line first (most distinctive)
-    let items = await fetchCustomerBatch(parsedAddr.street);
-
-    // Retry with house number + first street word if the full line over-filters
-    if (!items.length) {
-        let firstTokens = parsedAddr.street.split(/\s+/).slice(0, 2).join(" ");
-        if (firstTokens && firstTokens !== parsedAddr.street) {
-            items = await fetchCustomerBatch(firstTokens);
-        }
-    }
-    if (!items.length) return null;
-
-    // 1. Strict: street AND zip both present in the item's address
-    for (let item of items) {
-        let addr = ((item.Attributes && item.Attributes.Address) || "").toLowerCase();
-        if (street && addr.includes(street) && (!zip || addr.includes(zip))) return item;
-    }
-    // 2. Looser: street line matches (no zip confirmation)
-    for (let item of items) {
-        let addr = ((item.Attributes && item.Attributes.Address) || "").toLowerCase();
-        if (street && addr.includes(street)) return item;
-    }
-    return null;
-}
-
 async function findEstimatorMatch(scheduledPMRaw) {
     if (!scheduledPMRaw || scheduledPMRaw === "**NOT ASSIGNED**") return null;
     let raw = scheduledPMRaw.trim();
     if (!raw) return null;
 
-    let parts = raw.split(/\s+/);
-    let lastName = parts[parts.length - 1];
-    let firstName = parts.length >= 2 ? parts.slice(0, -1).join(" ") : "";
+    // Accepts "First Last", "First M. Last", "Last, First"
+    let name = splitName(raw);
+    let lastName = name.last || name.first;
+    let firstName = name.last ? name.first : "";
 
     let lastLower = lastName.toLowerCase();
     let firstLower = firstName.toLowerCase();
@@ -201,6 +151,9 @@ async function findEstimatorMatch(scheduledPMRaw) {
                 if (t.includes(lastLower) && t.includes(firstLower)) return item;
             }
         }
+        // Single-word name (or no first-name hit): accept an unambiguous last-name match
+        let lastOnly = items.filter(item => (item.Text.toLowerCase().split(",")[0] || "").trim() === lastLower);
+        if (lastOnly.length === 1) return lastOnly[0];
         await new Promise(r => setTimeout(r, 100));
     }
     return null;
@@ -289,7 +242,14 @@ async function findEstimatorMatch(scheduledPMRaw) {
         "mold":       { lossType: "Mold",       secondary: "Mold Remediation" },
         "bio hazard": { lossType: "Bio Hazard", secondary: "Bio Hazard Remediation" },
         "biohazard":  { lossType: "Bio Hazard", secondary: "Bio Hazard Remediation" },
-        "reconstruction": { lossType: "Reconstruction", secondary: "Reconstruction" }
+        "reconstruction": { lossType: "Reconstruction", secondary: "Reconstruction" },
+        // extra keywords matched as whole words inside the Type of Loss text ("Fire/Smoke", "Flood Damage", "Sewer Backup")
+        "flood":      { lossType: "Water",      secondary: "Water Damage Remediation" },
+        "sewer":      { lossType: "Water",      secondary: "Water Damage Remediation" },
+        "smoke":      { lossType: "Fire",       secondary: "Fire Remediation" },
+        "soot":       { lossType: "Fire",       secondary: "Fire Remediation" },
+        "trauma":     { lossType: "Bio Hazard", secondary: "Bio Hazard Remediation" },
+        "hoarding":   { lossType: "Bio Hazard", secondary: "Bio Hazard Remediation" }
     };
     const DEFAULT_LOSS_TYPE = { lossType: "Other", secondary: "Other" };
 
@@ -310,6 +270,7 @@ async function findEstimatorMatch(scheduledPMRaw) {
         DateOfLoss:        "ctl00_ContentPlaceHolder1_JobParentInformation_GenaralInfo_DatePicker_DateOffLoss",
         Estimator:         "ctl00_ContentPlaceHolder1_JobParentInformation_InternalParticpantsControl_InternalParticipantsList_ctl00_EstimatorComboBox",
         InsuranceCarrier:  "ctl00_ContentPlaceHolder1_JobParentInformation_ExternalParticipants_SystemCompanyParticipantCombobox_3",
+        TPACompany:        "ctl00_ContentPlaceHolder1_JobParentInformation_ExternalParticipants_SystemCompanyParticipantCombobox_23",
         SelfPayCheckBox:   "ctl00_ContentPlaceHolder1_JobParentInformation_SelfPayJobCheckBox",
         ClaimNumber:       "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_ClaimNumber",
         PolicyNumber:      "ctl00_ContentPlaceHolder1_JobParentInformation_TextBox_PolicyNumber",
@@ -381,10 +342,142 @@ async function findEstimatorMatch(scheduledPMRaw) {
         "biohazard":      "Biohazard",
         "reconstruction": "Reconstruction",
         "duct cleaning":  "Duct Cleaning",
+        "duct":           "Duct Cleaning",
         "contents":       "Contents",
-        "temporary repairs": "Temporary Repairs"
+        "temporary repairs": "Temporary Repairs",
+        "flood":          "Water",
+        "sewer":          "Water",
+        "smoke":          "Fire",
+        "soot":           "Fire",
+        "trauma":         "Biohazard",
+        "hoarding":       "Biohazard"
     };
     const DEFAULT_DIVISION = "Other";
+
+    // ==========================================
+    //  SHARED NORMALIZERS (data key values, names, phones, emails, dates)
+    // ==========================================
+    const EXPECTED_COLUMNS = Object.keys(COLUMN).length;
+
+    // Values that mean "nothing was entered" and must never be typed into a form field.
+    // ("unknown" and "no" are NOT here - they are real answers for Cause of Loss / yes-no columns.)
+    const PLACEHOLDER_VALUES = new Set(["", "n/a", "na", "n.a.", "none", "null", "undefined", "tbd", "tba", "-", "--", "—", "?", "not applicable", "not available", "not provided", "nil"]);
+    function cleanValue(v) {
+        if (v === undefined || v === null) return "";
+        let s = String(v).replace(/ /g, " ").trim();
+        return PLACEHOLDER_VALUES.has(s.toLowerCase()) ? "" : s;
+    }
+
+    // Split the pasted key into columns. Returns { data, warning } so the UI can flag a shifted key.
+    function parseDataKey(rawData) {
+        const data = String(rawData || "").split('|||').map(cleanValue);
+        let warning = "";
+        if (data.length !== EXPECTED_COLUMNS) {
+            warning = `Data key has ${data.length} columns (expected ${EXPECTED_COLUMNS}) - fields may be shifted.`;
+            console.warn(warning, data);
+        }
+        return { data, warning };
+    }
+
+    // Regex-escape helper (shared)
+    const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Case-insensitive, word-boundary lookup: "Water Damage" -> map["water"], "Fire/Smoke" -> map["fire"].
+    // Exact key wins; otherwise the longest key found as whole words in the text.
+    function lookupByKeyword(map, text) {
+        const t = (text || "").toLowerCase().trim();
+        if (!t) return null;
+        if (Object.prototype.hasOwnProperty.call(map, t)) return map[t];
+        const keys = Object.keys(map).sort((a, b) => b.length - a.length);
+        for (const k of keys) {
+            if (new RegExp('\\b' + escapeRe(k).replace(/\s+/g, '\\s+') + '\\b').test(t)) return map[k];
+        }
+        return null;
+    }
+
+    // Name splitting shared by WorkCenter + CreateJob so both pages get the same First / Last.
+    // Handles "First Last", "First M. Last", "Last, First", "Mr. John Smith Jr.", "John Smith (Property Manager)", "John Smith - ABC Corp"
+    const NAME_PREFIXES = new Set(["mr", "mrs", "ms", "miss", "mx", "dr", "rev", "prof", "capt", "sgt", "lt", "col", "hon"]);
+    const NAME_SUFFIXES = new Set(["jr", "sr", "ii", "iii", "iv", "esq", "phd", "md", "dds", "cpa"]);
+    function splitName(raw) {
+        let s = cleanValue(raw)
+            .replace(/\s*\([^)]*\)\s*/g, " ")                 // "(Property Manager)"
+            .split(/\s+[-–—\/|]\s+/)[0]                 // "John Smith - ABC Corp", "John / Jane"
+            .replace(/\s+/g, " ").trim();
+        const bare = w => w.replace(/\./g, "").toLowerCase();
+        let first = "", last = "";
+        if (!s) return { first, last, full: "" };
+
+        let commaParts = s.split(",").map(p => p.trim()).filter(Boolean);
+        if (commaParts.length >= 2 && !/\s/.test(commaParts[0])) {
+            // "Smith, John" / "Smith, John, Jr."
+            last = commaParts[0];
+            first = commaParts.slice(1).filter(p => !NAME_SUFFIXES.has(bare(p))).join(" ");
+        } else {
+            let words = (commaParts[0] || s).split(/\s+/).filter(Boolean);
+            while (words.length > 1 && NAME_PREFIXES.has(bare(words[0]))) words.shift();
+            while (words.length > 1 && NAME_SUFFIXES.has(bare(words[words.length - 1]))) words.pop();
+            if (words.length >= 2) { last = words[words.length - 1]; first = words.slice(0, -1).join(" "); }
+            else first = words[0] || "";
+        }
+        return { first, last, full: [first, last].filter(Boolean).join(" ") };
+    }
+
+    // First 10-digit US phone number in a string -> "8045551234" (or "" if none).
+    // Ignores extensions, a leading +1 / 1, and a second number after "/" or ",".
+    const PHONE_RE = /(?:\+?1[\s.\-]*)?\(?\s*(\d{3})\s*\)?[\s.\-]*(\d{3})[\s.\-]*(\d{4})(?!\d)/;
+    function extractPhone(raw) {
+        const s = cleanValue(raw);
+        if (!s) return "";
+        const m = s.match(PHONE_RE);
+        if (m) return m[1] + m[2] + m[3];
+        const digits = s.replace(/\D/g, "");
+        if (digits.length === 11 && digits[0] === "1") return digits.slice(1);
+        if (digits.length === 10) return digits;
+        return "";
+    }
+    const formatPhoneParens = d => d ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}` : "";
+
+    // First well-formed email address in a string (or "")
+    function extractEmail(raw) {
+        const m = cleanValue(raw).match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/);
+        return m ? m[0] : "";
+    }
+
+    // Date column -> JS Date (local midnight). Accepts an Excel serial ("45945"), "10/14/2025", "10-14-25", "2025-10-14", or anything Date can parse.
+    // (Previously a "10/14/2025" string was run through parseFloat -> 10 -> Jan 10 1900.)
+    function parseDataDate(raw) {
+        const s = cleanValue(raw);
+        if (!s) return null;
+        if (/^\d+(\.\d+)?$/.test(s)) return excelDateToJSDate(parseFloat(s));
+        let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+        if (m) {
+            let y = parseInt(m[3], 10); if (m[3].length === 2) y += 2000;
+            const d = new Date(y, parseInt(m[1], 10) - 1, parseInt(m[2], 10));
+            return isNaN(d) ? null : d;
+        }
+        m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+        if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+        const d = new Date(s);
+        return isNaN(d) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    }
+
+    // Resolve the loss/billing pair, honoring "same as ..." shorthand in either field.
+    // billingSameAsLoss drives the "Same as Customer" checkbox (CreateJob) / "Same as Caller" kicker (WorkCenter).
+    function resolveAddressPair(lossRaw, billingRaw) {
+        let loss = cleanValue(lossRaw), billing = cleanValue(billingRaw);
+        const saysSame = s => /\bsame\b/i.test(s) && !/\d/.test(s);   // "Same as loss", but not "123 Same St"
+        const lossSame = saysSame(loss), billingSame = saysSame(billing);
+        if (lossSame && billingSame) {
+            console.warn("Both Loss and Billing address say 'same as ...' - no real address in the data key");
+            loss = ""; billing = "";
+        } else if (lossSame) {
+            loss = billing;
+        }
+        const billingSameAsLoss = billingSame || !billing || (!!loss && billing.toLowerCase() === loss.toLowerCase());
+        if (billingSameAsLoss) billing = loss;
+        return { loss, billing, billingSameAsLoss };
+    }
 
 // --- Floating UI Setup ---
     const isDash = location.hostname.includes('ngsapps.net');
@@ -454,8 +547,21 @@ async function findEstimatorMatch(scheduledPMRaw) {
     btn.style.cursor = 'pointer';
     btn.style.borderRadius = '3px';
 
+    const statusLine = document.createElement('div');
+    statusLine.style.fontFamily = 'Arial, sans-serif';
+    statusLine.style.fontSize = '11px';
+    statusLine.style.marginTop = '6px';
+    statusLine.style.minHeight = '14px';
+    statusLine.style.color = '#444';
+    statusLine.style.whiteSpace = 'normal';
+    function setStatus(msg, isError) {
+        statusLine.textContent = msg || '';
+        statusLine.style.color = isError ? '#c0392b' : '#444';
+    }
+
     body.appendChild(inputBox);
     body.appendChild(btn);
+    body.appendChild(statusLine);
 
     panel.appendChild(header);
     panel.appendChild(body);
@@ -519,11 +625,20 @@ async function findEstimatorMatch(scheduledPMRaw) {
             console.log(`Zip ${parsed.zip}: page lookup ${lookupDone ? "populated" : "did NOT change"} state (${ids.state.split('_').pop()})`);
         }
 
-        if (parsed.city) setPlainTextBox(ids.city, parsed.city);
+        if (parsed.city) {
+            const pageCity = (document.getElementById(ids.city) || {}).value || "";
+            if (pageCity && pageCity.toLowerCase().trim() !== parsed.city.toLowerCase()) {
+                console.log(`⚠ Zip lookup city "${pageCity}" differs from parsed city "${parsed.city}" - using parsed value`);
+            }
+            setPlainTextBox(ids.city, parsed.city);
+        }
 
-        // Trust the page's zip lookup if it filled the state; only set it ourselves otherwise
+        // Trust the page's zip lookup if it filled the state; only set it ourselves otherwise.
+        // Try "VA" then "Virginia" - the list text differs between controls.
         if (parsed.state && stEl && !lookupDone) {
-            setRadComboByText(stEl, parsed.state, true);
+            for (const candidate of stateCandidates(parsed.state)) {
+                if (setRadComboByText(stEl, candidate, true)) break;
+            }
         }
     }
 
@@ -556,9 +671,9 @@ function setPlainTextBox(id, value) {
     // Masked phone setter ( mask is _-___-___-____ → 1-XXX-XXX-XXXX )
     function setMaskedPhone(id, rawPhone) {
         if (!rawPhone) return;
-        let digits = (rawPhone.match(/\d/g) || []).join("");
-        if (digits.length === 10) digits = "1" + digits;       // prepend country code
-        if (digits.length < 11) return;
+        let digits = extractPhone(rawPhone);                   // first 10-digit number only (ignores extensions / second numbers)
+        if (!digits) { console.log(`⚠ Skipped phone ${id}: no 10-digit number in "${rawPhone}"`); return; }
+        digits = "1" + digits;                                 // prepend country code
         let formatted = `${digits[0]}-${digits.slice(1,4)}-${digits.slice(4,7)}-${digits.slice(7,11)}`;
 
         let el = document.getElementById(id);
@@ -609,114 +724,238 @@ function setPlainTextBox(id, value) {
         console.log(`✓ Set address ${id} → ${value}`);
     }
 
+    // Excel serial -> local-midnight JS Date. Uses UTC getters so it is correct in any timezone
+    // (the old "+1 day" trick only worked west of UTC).
     function excelDateToJSDate(serial) {
+        serial = parseFloat(serial);
         if (!serial || isNaN(serial)) return null;
-        const utc_days  = Math.floor(serial - 25569);
-        const utc_value = utc_days * 86400;
-        const date_info = new Date(utc_value * 1000);
-        return new Date(date_info.getFullYear(), date_info.getMonth(), date_info.getDate() + 1);
+        const d = new Date(Math.round((serial - 25569) * 86400 * 1000));
+        return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
     }
 
-    function parseTimeWindow(timeStr, dateBase) {
-        if (!dateBase || !timeStr) return { begin: null, end: null };
-        let parts = timeStr.toLowerCase().replace(/\s+/g, '').split('-');
-        if (parts.length < 2) return { begin: dateBase, end: dateBase };
-        let beginStr = parts[0], endStr = parts[1];
-        let isPmEnd = endStr.includes('pm'), isAmEnd = endStr.includes('am');
-        let isPmBegin = beginStr.includes('pm') || (isPmEnd && !beginStr.includes('am'));
-
-        let beginHour = parseInt(beginStr.match(/\d+/)[0]);
-        let endHour = parseInt(endStr.match(/\d+/)[0]);
-        if (isPmBegin && beginHour !== 12) beginHour += 12;
-        if (!isPmBegin && beginHour === 12) beginHour = 0;
-        if (isPmEnd && endHour !== 12) endHour += 12;
-        if (isAmEnd && endHour === 12) endHour = 0;
-        if (isPmEnd && beginHour > endHour && beginHour < 12) beginHour -= 12;
-
-        let beginDate = new Date(dateBase); beginDate.setHours(beginHour, 0, 0, 0);
-        let endDate = new Date(dateBase); endDate.setHours(endHour, 0, 0, 0);
-        return { begin: beginDate, end: endDate };
+    // ==========================================
+    //  ADDRESS PARSER
+    //  Handles: "123 Main St, Richmond, VA 23220" / "123 Main St Richmond VA 23220-1234" /
+    //           "123 Main St, Apt 4, Richmond, Virginia 23220" / "123 Main Street Apt 4 Newport News VA" /
+    //           multi-line pastes / "Richmond, VA 23220" (no street) / "Acme Corp, 123 Main St, ..." / trailing USA
+    // ==========================================
+    const US_STATES = {
+        "Alabama":"AL","Alaska":"AK","Arizona":"AZ","Arkansas":"AR","California":"CA","Colorado":"CO","Connecticut":"CT","Delaware":"DE",
+        "District of Columbia":"DC","Florida":"FL","Georgia":"GA","Hawaii":"HI","Idaho":"ID","Illinois":"IL","Indiana":"IN","Iowa":"IA",
+        "Kansas":"KS","Kentucky":"KY","Louisiana":"LA","Maine":"ME","Maryland":"MD","Massachusetts":"MA","Michigan":"MI","Minnesota":"MN",
+        "Mississippi":"MS","Missouri":"MO","Montana":"MT","Nebraska":"NE","Nevada":"NV","New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM",
+        "New York":"NY","North Carolina":"NC","North Dakota":"ND","Ohio":"OH","Oklahoma":"OK","Oregon":"OR","Pennsylvania":"PA","Rhode Island":"RI",
+        "South Carolina":"SC","South Dakota":"SD","Tennessee":"TN","Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA","Washington":"WA",
+        "West Virginia":"WV","Wisconsin":"WI","Wyoming":"WY"
+    };
+    const US_STATE_CODES = new Set(Object.values(US_STATES));
+    const STATE_NAME_BY_CODE = {};
+    for (const [name, code] of Object.entries(US_STATES)) if (!STATE_NAME_BY_CODE[code]) STATE_NAME_BY_CODE[code] = name;
+    const STATE_NAME_ALT = Object.keys(US_STATES).sort((a, b) => b.length - a.length).map(n => escapeRe(n).replace(/\s+/g, '\\s+')).join('|');
+    function stateCodeFrom(s) {
+        const t = (s || "").trim().replace(/\s+/g, ' ');
+        if (!t) return "";
+        if (t.length === 2) return US_STATE_CODES.has(t.toUpperCase()) ? t.toUpperCase() : "";
+        const k = Object.keys(US_STATES).find(n => n.toLowerCase() === t.toLowerCase());
+        return k ? US_STATES[k] : "";
+    }
+    // Texts to try on a state dropdown, in order: "VA" then "Virginia" (the two pages list states differently)
+    function stateCandidates(code) {
+        if (!code) return [];
+        const c = code.toUpperCase();
+        return STATE_NAME_BY_CODE[c] ? [c, STATE_NAME_BY_CODE[c]] : [c];
     }
 
-    // Phase 19+ address parser (state+zip extracted together to avoid matching house numbers)
-    const US_STATE_CODES = new Set(["AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"]);
+    // Street suffixes that reliably end a street line (deliberately excludes words common in city names: Hill, Park, Ridge, Springs...)
+    const STREET_SUFFIXES = new Set(['street','st','avenue','ave','av','road','rd','boulevard','blvd','drive','dr','lane','ln','court','ct','place','pl',
+        'terrace','ter','terr','parkway','pkwy','pky','pike','highway','hwy','way','circle','cir','trail','trl','loop','square','sq','plaza','plz',
+        'turnpike','tpke','alley','aly','crossing','xing','cove','cv','bend','bnd','extension','ext','freeway','fwy','expressway','expy','causeway','cswy',
+        'bypass','byp','route','rte','path','row','walk','trace','trce','crescent','cres','commons','cmns','manor','mnr','hollow','holw','knoll','knl']);
+    const UNIT_WORD_RE = /^(apt|apartment|unit|suite|ste|bldg|building|fl|floor|lot|rm|room|trlr|trailer|ofc|office|dept|pmb|spc|space|no)\.?$/i;
+    const UNIT_PART_RE = /^(?:(?:apt|apartment|unit|suite|ste|bldg|building|fl|floor|lot|rm|room|trlr|trailer|ofc|office|dept|pmb|spc|space|#)\.?\s*\S+|#?\d+[a-z]?|\d+(?:st|nd|rd|th)?\s*(?:floor|fl)\.?)$/i;
+    const DIRECTIONAL_RE = /^(n|s|e|w|ne|nw|se|sw|north|south|east|west|northeast|northwest|southeast|southwest)\.?$/i;
+
+    // Multi-word city names in / around the service area, so "123 Main St Virginia Beach VA" splits correctly without commas.
+    const MULTI_WORD_CITIES = [
+        // Richmond / Tri-Cities
+        "North Chesterfield","South Chesterfield","Glen Allen","Highland Springs","Bon Air","Short Pump","Colonial Heights","Prince George",
+        "South Prince George","Fort Lee","Fort Gregg-Adams","Church Road","New Kent","King William","West Point","Charles City","Ruther Glen",
+        "Manakin Sabot","Manakin-Sabot","Stony Creek","South Hill","North Dinwiddie","Spring Grove","Lake Monticello",
+        // Hampton Roads
+        "Virginia Beach","Newport News","Fort Monroe","Fort Eustis","Isle of Wight","Cape Charles","Oak Hall","Chincoteague Island","Wallops Island",
+        "Great Bridge","Deep Creek","Western Branch","South Norfolk","Ocean View","Buckroe Beach","Fox Hill","Lee Hall","James City","Battery Park",
+        // NC / Outer Banks
+        "Elizabeth City","Kill Devil Hills","Kitty Hawk","Nags Head","Southern Shores","Point Harbor","Powells Point","South Mills","Knotts Island",
+        "Manns Harbor","Stumpy Point","Swan Quarter","Cape Hatteras","Pine Island","Roanoke Island",
+        // Northern Virginia / DC / MD
+        "Falls Church","West Falls Church","East Falls Church","Great Falls","Fairfax Station","South Riding","Stone Ridge","Round Hill",
+        "Paeonian Springs","West Springfield","North Springfield","North Arlington","Tysons Corner","Dunn Loring","Oak Hill","Fort Belvoir",
+        "Mount Vernon","Rose Hill","Seven Corners","Baileys Crossroads","Bailey's Crossroads","Lake Ridge","Dale City","Manassas Park",
+        "The Plains","Potomac Falls","Sugarland Run","One Loudoun","Fair Oaks","Fair Lakes","Kings Park","Burke Centre","Crystal City",
+        "Pentagon City","Virginia Square","Chevy Chase","Silver Spring","Takoma Park","College Park","Oxon Hill","Fort Washington",
+        "National Harbor","Indian Head","La Plata","Saint Charles","St Charles","St. Charles","Bryans Road","Capitol Heights","District Heights",
+        "Temple Hills","Camp Springs","New Carrollton","Glenn Dale","Upper Marlboro","Bull Run"
+    ];
+    const normCity = s => s.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim()
+        .replace(/^n /, 'north ').replace(/^s /, 'south ').replace(/^e /, 'east ').replace(/^w /, 'west ');
+    const MULTI_WORD_CITY_SET = new Set(MULTI_WORD_CITIES.map(normCity));
+
+    // Number of trailing words that form a known multi-word city (0 = none). Always leaves >= 2 words for the street.
+    function trailingCityWords(words) {
+        for (let n = Math.min(4, words.length - 2); n >= 2; n--) {
+            if (MULTI_WORD_CITY_SET.has(normCity(words.slice(-n).join(' ')))) return n;
+        }
+        return 0;
+    }
+    const isSuffixWord = w => STREET_SUFFIXES.has(w.toLowerCase().replace(/\.$/, ''));
+    const looksLikeStreet = s => /\d/.test(s) || /\bp\.?\s?o\.?\s*box\b/i.test(s) || s.split(/\s+/).some(isSuffixWord);
 
     function parseAddress(raw) {
-    let result = { street: "", city: "", state: "", zip: "" };
-    if (!raw) return result;
+        const result = { street: "", city: "", state: "", zip: "" };
+        if (!raw) return result;
 
-    let cleanStr = raw.replace(/[,\s]*\b(USA|US|United States)\b\.?\s*$/i, "").trim();
+        let cleanStr = String(raw).replace(/ /g, ' ')
+            .replace(/\s*[\r\n]+\s*/g, ', ')                       // multi-line paste -> comma separated
+            .replace(/\s+/g, ' ').trim();
+        cleanStr = cleanStr.replace(/[,\s]*\b(U\.?S\.?A?\.?|United States(?: of America)?)\s*$/i, '').trim();
+        cleanStr = cleanStr.replace(/[,\s.]+$/, '');
 
-    // 1. State + zip together; take the LAST match whose state code is a real US state
-    let re = /\b([A-Za-z]{2})\.?,?\s+(\d{5})(?:-\d{4})?\b/g, m, found = null;
-    while ((m = re.exec(cleanStr)) !== null) {
-        if (US_STATE_CODES.has(m[1].toUpperCase())) found = m;
-    }
-    if (found) {
-        result.state = found[1].toUpperCase();
-        result.zip = found[2];
-        cleanStr = cleanStr.slice(0, found.index) + cleanStr.slice(found.index + found[0].length);
-    } else {
-        // 2. Fallback: a trailing 5-digit zip with no state ("Richmond, 23220")
-        let zipOnly = cleanStr.match(/[,\s]+(\d{5})(?:-\d{4})?\s*$/);
-        if (zipOnly) {
-            result.zip = zipOnly[1];
-            cleanStr = cleanStr.slice(0, zipOnly.index);
+        // 1. State (code OR full name) + zip, anywhere in the string; keep the LAST valid match
+        const stateZipRe = new RegExp('\\b([A-Za-z]{2}|' + STATE_NAME_ALT + ')\\.?[,\\s]+(\\d{5})(?:-\\d{4})?\\b', 'gi');
+        let m, found = null;
+        while ((m = stateZipRe.exec(cleanStr)) !== null) {
+            let code = stateCodeFrom(m[1]);
+            if (!code) continue;
+            const before = cleanStr.slice(0, m.index);
+            const isCode = m[1].length === 2;
+            // "123 Main Ct 23220" / "123 Main St NE 20002": CT / NE here is a suffix or directional, not a state,
+            // unless a comma or a city precedes it
+            if (isCode && (code === 'CT' || code === 'NE') && !/,\s*$/.test(before) && before.trim().split(/\s+/).length <= 3) continue;
+            let removeFrom = m.index;
+            // "Washington 20001" (no DC): that's the city, not Washington State
+            if (!isCode && code === 'WA' && /^20[0-5]/.test(m[2])) { code = 'DC'; removeFrom = m.index + m[1].length; }
+            found = { from: removeFrom, to: m.index + m[0].length, code, zip: m[2] };
         }
-        // 3. State alone at the end ("Richmond VA")
-        let stateOnly = cleanStr.match(/[,\s]+([A-Z]{2})\.?\s*$/);
-        if (stateOnly && US_STATE_CODES.has(stateOnly[1].toUpperCase())) {
-            result.state = stateOnly[1].toUpperCase();
-            cleanStr = cleanStr.slice(0, stateOnly.index);
-        }
-    }
-
-    cleanStr = cleanStr.replace(/[,\s]+$/, "").trim();
-
-    // ---- street / city split (unchanged from your version) ----
-    if (cleanStr.includes(',')) {
-        let parts = cleanStr.split(',').map(p => p.trim());
-        result.street = parts[0];
-        result.city = parts[1] || "";
-    } else {
-        let suffixes = ['street','avenue','road','boulevard','drive','lane','court','place','terrace','parkway','pike','highway','way'];
-        let words = cleanStr.split(/\s+/);
-        let splitIndex = -1;
-        for (let i = words.length - 1; i >= 0; i--) {
-            let word = words[i].toLowerCase().replace(/\.$/, '');
-            if (suffixes.includes(word)) { splitIndex = i; break; }
-        }
-        if (splitIndex !== -1 && splitIndex < words.length - 1) {
-            result.street = words.slice(0, splitIndex + 1).join(' ').trim();
-            result.city = words.slice(splitIndex + 1).join(' ').trim();
+        if (found) {
+            result.state = found.code;
+            result.zip = found.zip;
+            cleanStr = cleanStr.slice(0, found.from) + cleanStr.slice(found.to);
         } else {
-            result.city = words.pop().trim();
-            result.street = words.join(' ').trim();
+            // 2. Trailing zip with no state ("Richmond, 23220")
+            const zipOnly = cleanStr.match(/(?:^|[,\s]+)(\d{5})(?:-\d{4})?\s*$/);
+            if (zipOnly) { result.zip = zipOnly[1]; cleanStr = cleanStr.slice(0, zipOnly.index); }
+            // 3. Trailing state with no zip: full name ("Richmond, Virginia") - "Washington" alone is treated as the city
+            const nameAlt = STATE_NAME_ALT.split('|').filter(n => n.toLowerCase() !== 'washington').join('|');
+            const nameOnly = cleanStr.match(new RegExp('(?:^|[,\\s]+)(' + nameAlt + ')\\.?\\s*$', 'i'));
+            if (nameOnly) {
+                result.state = stateCodeFrom(nameOnly[1]);
+                cleanStr = cleanStr.slice(0, nameOnly.index);
+            } else {
+                // ... or a 2-letter code ("Richmond, VA" / "Richmond VA"). Without a comma it must be upper-case and
+                // not a code that doubles as an English word / street abbreviation (CT, NE, CO, IN, OR, DE, LA, ME, OK, OH, ID, HI).
+                const codeOnly = cleanStr.match(/([,\s]+)([A-Za-z]{2})\.?\s*$/);
+                if (codeOnly) {
+                    const code = codeOnly[2].toUpperCase();
+                    const afterComma = codeOnly[1].includes(',');
+                    const upper = codeOnly[2] === code;
+                    const ambiguous = new Set(['CT','NE','CO','IN','OR','DE','LA','ME','OK','OH','ID','HI']);
+                    if (US_STATE_CODES.has(code) && (afterComma || (upper && !ambiguous.has(code)))) {
+                        result.state = code;
+                        cleanStr = cleanStr.slice(0, codeOnly.index);
+                    }
+                }
+            }
         }
-    }
-    return result;
-}
+        cleanStr = cleanStr.replace(/^[,\s]+|[,\s]+$/g, '').replace(/\s+,/g, ',').trim();
+        if (!cleanStr) return result;
 
-    // Comprehensive Fallback Resolver for Franchise
+        // 4. Street / city split
+        if (cleanStr.includes(',')) {
+            let parts = cleanStr.split(',').map(p => p.trim()).filter(Boolean);
+            // "Acme Corp, 123 Main St, Richmond": drop a leading name line when the next part starts with a house number
+            if (parts.length >= 2 && !looksLikeStreet(parts[0]) && /^\d/.test(parts[1])) parts.shift();
+            let street = parts.shift() || "";
+            // "123 Main St, Apt 4, Richmond" / "123 Main St, #12, Richmond": fold unit parts into the street line
+            while (parts.length && UNIT_PART_RE.test(parts[0])) street += " " + parts.shift();
+            if (!parts.length && !looksLikeStreet(street)) {        // "Richmond, Henrico County" style: no street at all
+                result.city = street;
+            } else {
+                result.street = street;
+                result.city = parts[0] || "";
+            }
+        } else {
+            const words = cleanStr.split(' ');
+            if (!/\d/.test(cleanStr) && !looksLikeStreet(cleanStr)) {       // "Virginia Beach"
+                result.city = cleanStr;
+                return result;
+            }
+            const splitAt = n => { result.street = words.slice(0, n).join(' '); result.city = words.slice(n).join(' '); };
+            const tail = trailingCityWords(words);
+            let suffixIdx = -1;
+            for (let i = words.length - 1; i >= 1; i--) { if (isSuffixWord(words[i])) { suffixIdx = i; break; } }
+
+            if (tail) {
+                splitAt(words.length - tail);                                  // "123 Main St Apt 4 Newport News"
+            } else if (suffixIdx !== -1) {
+                let j = suffixIdx + 1;
+                // Absorb unit designators that follow the suffix: "Apt 4B", "Suite 200", "#12", "Unit B"
+                while (j < words.length) {
+                    if (/^#/.test(words[j])) { j += 1; continue; }
+                    if (UNIT_WORD_RE.test(words[j]) && j + 1 < words.length) { j += 2; continue; }
+                    break;
+                }
+                // Absorb a directional ("Main St NW Washington", "Main St NE") unless it starts a known city ("N Chesterfield")
+                if (j < words.length && DIRECTIONAL_RE.test(words[j]) && (j === words.length - 1 || !MULTI_WORD_CITY_SET.has(normCity(words.slice(j).join(' '))))) j += 1;
+                if (j < words.length) splitAt(j);
+                else result.street = cleanStr;                                 // suffix is the last word: no city present
+            } else if (words.length >= (/^\d/.test(words[0]) ? 3 : 4)) {
+                splitAt(words.length - 1);                                     // "123 Broadway Richmond" / "PO Box 12 Richmond"
+            } else {
+                result.street = cleanStr;
+            }
+        }
+        result.street = result.street.replace(/\s+/g, ' ').trim();
+        result.city = result.city.replace(/\s+/g, ' ').trim();
+        return result;
+    }
+
+    // City-name fallbacks (word-boundary regexes) used only when the zip is not in zipToFranchiseMap.
+    // Order matters: more specific names first (Fairfax Station -> WS before Fairfax -> F, Falls Church -> V, etc.).
+    const cityToFranchiseFallback = [
+        [/\b(virginia|va)\.?\s+beach\b/,                                                                   "Kempsville (K) 12120"],
+        [/\bchesterfield\b|\bchester\b|\bmidlothian\b|\bmoseley\b|\bbon air\b/,                            "Chesterfield (C) 5248"],
+        [/\brichmond\b/,                                                                                  "Richmond (R) 10313"],
+        [/\bhenrico\b|\bglen allen\b|\bshort pump\b|\bsandston\b|\bhighland springs\b|\bmechanicsville\b|\btuckahoe\b/, "Henrico (H) 10314"],
+        [/\bpetersburg\b|\bhopewell\b|\bcolonial heights\b|\bprince george\b|\bdinwiddie\b|\bfort (lee|gregg)/, "Tri-Cities (T) 8510"],
+        [/\bchesapeake\b/,                                                                                "Chesapeake N (CN) 11281"],
+        [/\bhampton\b|\bpoquoson\b|\bfort monroe\b/,                                                      "Hampton North (HN) 11282"],
+        [/\bnorfolk\b/,                                                                                   "Norfolk (N) 11593"],
+        [/\bportsmouth\b/,                                                                                "Portsmouth (P) 11594"],
+        [/\bnewport news\b|\bfort eustis\b/,                                                              "Newport News (NN) 12119"],
+        [/\belizabeth city\b|\bkill devil hills\b|\bkitty hawk\b|\bnags head\b|\bmanteo\b|\bcorolla\b|\bduck\b|\bmoyock\b|\bcurrituck\b|\bcamden\b|\bouter banks\b|\bobx\b|\bsouthern shores\b|\bhatteras\b/, "Elizabeth City/OBX (EC) 11283"],
+        [/\bleesburg\b|\bpurcellville\b|\blovettsville\b|\bhamilton\b|\bround hill\b|\bwaterford\b|\blucketts\b|\bbluemont\b|\bhillsboro\b/, "Loudoun N/Leesburg (LN) 12095"],
+        [/\bsterling\b|\bdulles\b|\blansdowne\b|\bbroadlands\b|\bcascades\b|\bpotomac falls\b/,           "Loudoun E (LE) 12187"],
+        [/\baldie\b|\bchantilly\b|\bsouth riding\b|\bstone ridge\b|\bmiddleburg\b|\bbrambleton\b|\bcentreville\b/, "Loudoun S (LS) 12188"],
+        [/\barlington\b/,                                                                                 "N Arlington (NA) 12096"],
+        [/\bvienna\b|\bgreat falls\b|\btysons\b|\bmclean\b|\bmerrifield\b|\bdunn loring\b|\bfalls church\b/, "Vienna/ Great Falls (V) 12097"],
+        [/\bfairfax station\b|\bspringfield\b|\bnewington\b|\bburke\b|\blorton\b/,                        "W Springfield/ Newington (WS)"],
+        [/\bfairfax\b|\boakton\b|\bfair oaks\b|\bfair lakes\b/,                                           "Fairfax (F) 12186"]
+    ];
+
+    // Comprehensive Fallback Resolver for Franchise: zip map -> city name -> Environmental Code
     function resolveFranchise(zip, city, envCode) {
+        zip = (zip || "").trim();
         if (zip && zipToFranchiseMap[zip]) return zipToFranchiseMap[zip];
 
-        let cLower = (city || "").toLowerCase();
+        let cLower = normCity(city || "");
 
-        // Except VA Beach, that should be Kempsville
-        if (cLower.includes("virginia beach") || cLower.includes("va beach")) return "Kempsville (K) 12120";
+        // Tri-Cities will be any zip code that starts with 238 (except for Chester & Chesterfield, which the zip map already covers)
+        if (zip && zip.startsWith("238") && !/\bchester(field)?\b/.test(cLower)) return "Tri-Cities (T) 8510";
 
-        // Tri-Cities will be any zip code that starts with 238—(except for Chester & Chesterfield)
-        if (zip && zip.startsWith("238") && !cLower.includes("chester") && !cLower.includes("chesterfield")) return "Tri-Cities (T) 8510";
-
-        // If it’s Chesterfield area and not on the zip list, put to Chesterfield
-        if (cLower.includes("chesterfield") || cLower.includes("chester")) return "Chesterfield (C) 5248";
-
-        // If it’s Chesapeake area and not on the zip list, put to Chesapeake South or North (Map to CN)
-        if (cLower.includes("chesapeake")) return "Chesapeake N (CN) 11281";
-
-        // If it’s Arlington area and not on the zip list, put to N Arlington.
-        if (cLower.includes("arlington")) return "N Arlington (NA) 12096";
+        // City-name fallback (word-boundary, so "Winchester" no longer lands in Chesterfield)
+        for (const [re, key] of cityToFranchiseFallback) {
+            if (re.test(cLower)) return key;
+        }
 
         // The other fall back for this is that the Environmental code should be provided when the FNOL is submitted, so fall back to that if it's not in the zip range.
         if (envCode) {
@@ -727,34 +966,13 @@ function setPlainTextBox(id, value) {
             for (let key in franchiseNameTranslation) {
                 if (franchiseNameTranslation[key].toLowerCase() === eLower) return key;
             }
+            // Loose: the env code text names a franchise ("Henrico", "Loudoun County East")
+            for (let key in customCodeMap) {
+                if (customCodeMap[key].toLowerCase().includes(eLower) || eLower.includes(customCodeMap[key].toLowerCase())) return key;
+            }
         }
 
         return null;
-    }
-
-    function triggerKnockoutChange(elementId, value) {
-        let el = typeof elementId === 'string' ? document.getElementById(elementId) : elementId;
-        if (el && value !== undefined) {
-            window.jQuery(el).val(value);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-    }
-
-    function injectKO(selector, value, observableName) {
-        let el = document.querySelector(selector);
-        if (el && window.ko && value !== undefined && value !== "") {
-            let koData = window.ko.dataFor(el);
-            if (koData) {
-                if (typeof koData[observableName] === 'function') {
-                    koData[observableName](value);
-                } else if (koData[observableName] !== undefined) {
-                    koData[observableName] = value;
-                }
-            }
-            window.jQuery(el).val(value);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-        }
     }
 
         // Commits a value to the KO observable bound to the element (reads its data-bind), then fires DOM events.
@@ -810,10 +1028,8 @@ function setPlainTextBox(id, value) {
     }
 
     // Dedicated setter for the Project Notes textarea (#journalNote).
-    // injectKO's generic 'value' observableName never matches the real KO property
-    // (RMLead().LossNote), so the underlying observable was never actually updated -
-    // only the textarea's visible DOM value was set, which the framework then
-    // overwrote. This walks the KO context and commits the value directly.
+    // The real KO property is RMLead().LossNote; setting only the textarea's DOM value
+    // gets overwritten by the framework, so this walks the KO context and commits directly.
     function setJournalNote(value) {
         if (!value) return;
         let el = document.getElementById('journalNote');
@@ -848,56 +1064,65 @@ function setPlainTextBox(id, value) {
     }
 
     // PREDICATE KENDO ENGINE - Zero Mathematical Offsets (WorkCenter)
+    // `text` may be a string or an array of candidate strings (tried in order for an exact match).
+    // Returns true when something other than the placeholder ended up selected.
     function setKendoDropdownExact(elementId, text) {
-        if (!window.jQuery || !text) return;
+        if (!window.jQuery || !text) return false;
+        const candidates = (Array.isArray(text) ? text : [text]).filter(Boolean).map(t => String(t).toLowerCase().trim()).filter(Boolean);
+        if (!candidates.length) return false;
         let el = window.jQuery(`#${elementId}`);
         let widget = el.data("kendoDropDownList") || el.data("kendoComboBox");
+        if (!widget) { console.log(`✗ Kendo widget not found: #${elementId}`); return false; }
 
-        if (widget) {
-            let targetText = text.toLowerCase().trim();
+        const itemText = dataItem => {
+            if (dataItem === null || dataItem === undefined) return "";
+            if (typeof dataItem === 'string') return dataItem;
+            let tField = widget.options.dataTextField;
+            if (tField && dataItem[tField]) return dataItem[tField].toString();
+            return (dataItem.Name || dataItem.name || dataItem.Text || dataItem.text || dataItem.Description || "").toString();
+        };
+        const isPlaceholder = () => {
+            let d = widget.dataItem();
+            return !d || /select/i.test(itemText(d));
+        };
+        const trySelect = pred => {
+            widget.select(pred);
+            return widget.selectedIndex !== -1 && !isPlaceholder();
+        };
 
-            widget.select(function(dataItem) {
-                let itemText = "";
-                if (typeof dataItem === 'string') itemText = dataItem;
-                else {
-                    let tField = widget.options.dataTextField;
-                    if (tField && dataItem[tField]) itemText = dataItem[tField].toString();
-                    else itemText = (dataItem.Name || dataItem.name || dataItem.Text || dataItem.text || dataItem.Description || "").toString();
-                }
-                return itemText.toLowerCase().trim() === targetText;
-            });
-
-            let selectedData = widget.dataItem();
-            let isPlaceholder = !selectedData || selectedData === "Please Select..." || (selectedData.Name && selectedData.Name.includes("Select"));
-
-            if (widget.selectedIndex === -1 || isPlaceholder) {
-                widget.select(function(dataItem) {
-                    let itemText = "";
-                    if (typeof dataItem === 'string') itemText = dataItem;
-                    else {
-                        let tField = widget.options.dataTextField;
-                        if (tField && dataItem[tField]) itemText = dataItem[tField].toString();
-                        else itemText = (dataItem.Name || dataItem.name || dataItem.Text || dataItem.text || dataItem.Description || "").toString();
-                    }
-                    let lowerItem = itemText.toLowerCase().trim();
-                    if (!lowerItem || lowerItem.includes("please select")) return false;
-
-                    if (lowerItem.includes(targetText) || targetText.includes(lowerItem)) return true;
-
-                    let targetWords = targetText.split(/\s+/);
-                    let itemWords = lowerItem.split(/\s+/);
-                    if (targetWords.length > 1 && itemWords.length > 1) {
-                        if (itemWords[0][0] === targetWords[0][0] && itemWords[itemWords.length - 1] === targetWords[targetWords.length - 1]) {
-                            return true;
-                        }
-                    }
-                    return false;
-                });
-            }
-
-            widget.trigger("change");
-            if (el[0]) el[0].dispatchEvent(new Event('change', { bubbles: true }));
+        const prevValue = widget.value();
+        let ok = false;
+        for (const target of candidates) {
+            if (trySelect(d => itemText(d).toLowerCase().trim() === target)) { ok = true; break; }
         }
+
+        // Fuzzy fallback on the primary candidate only - never for 2-letter codes ("VA" is inside "Nevada")
+        const target = candidates[0];
+        if (!ok && target.length > 2) {
+            ok = trySelect(d => {
+                let lowerItem = itemText(d).toLowerCase().trim();
+                if (!lowerItem || lowerItem.includes("please select")) return false;
+                if (lowerItem.includes(target) || target.includes(lowerItem)) return true;
+                // Person-name style: same last word and a shared first-name start ("Mike Smith" ~ "Michael Smith", but not "Jon" ~ "Jane")
+                let targetWords = target.split(/\s+/), itemWords = lowerItem.split(/\s+/);
+                if (targetWords.length > 1 && itemWords.length > 1 && itemWords[itemWords.length - 1] === targetWords[targetWords.length - 1]) {
+                    let a = targetWords[0], b = itemWords[0];
+                    return a.startsWith(b) || b.startsWith(a) || (a.length >= 2 && a.slice(0, 2) === b.slice(0, 2));
+                }
+                return false;
+            });
+        }
+
+        if (!ok) {
+            // Nothing matched: put the previous selection back instead of leaving the control cleared
+            try { widget.value(prevValue); } catch (e) {}
+            console.log(`✗ No match for "${Array.isArray(text) ? text.join('" / "') : text}" in #${elementId}`);
+            return false;
+        }
+        widget.trigger("change");
+        if (el[0]) el[0].dispatchEvent(new Event('change', { bubbles: true }));
+        console.log(`✓ Set #${elementId} → ${itemText(widget.dataItem())}`);
+        return true;
     }
 
     // --- Reported By mapping (shared) ---
@@ -945,7 +1170,7 @@ function setPlainTextBox(id, value) {
             reportedBy = "Occupant/Tenant";
         } else if (reportedByLower.includes("onsite")) {
             reportedBy = "Onsite Contact";
-        } else if (reportedByLower.includes("other relative")) {
+        } else if (reportedByLower.includes("relative") || reportedByLower.includes("family")) {
             reportedBy = "Other Relative";
         } else if (reportedByLower.includes("owner")) {
             reportedBy = "Owner";
@@ -1009,6 +1234,32 @@ function setPlainTextBox(id, value) {
         return null;
     }
 
+    // --- TPA Company for CreateJob - derived from "How did you hear about SERVPRO?" ---
+    // Option text as it appears in the TPA Company combo. If the live list spells one differently, change it here.
+    const TPA_OPTIONS = { ALACRITY: "Alacrity", WESTHILL: "Westhill", HQ: "SERVPRO HQ", CC: "Contractor Connection" };
+    // Exact item values captured from the live TPA Company combo (Oct 2026), used when the load-on-demand lookup
+    // can't find the text - same idea as the Self-Pay 1171692 fallback for Insurance Carrier.
+    const TPA_KNOWN_VALUES = {
+        "Alacrity":              "2850880",
+        "Westhill":              "2843891",
+        "SERVPRO HQ":            "2843887",
+        "Contractor Connection": "2843889"
+    };
+
+    // Tolerant of spacing, punctuation and typos: "ContractorConnections", "West Hill", "Servpro,com Call", "servpro hq", "Alacraty"
+    function mapTPA(referredByRaw, hqRefRaw) {
+        const text = cleanValue(referredByRaw).toLowerCase();
+        const squash = text.replace(/[^a-z0-9]/g, "");          // "contractor connections" -> "contractorconnections"
+        if (/alacr/.test(squash)) return TPA_OPTIONS.ALACRITY;
+        if (/westhil/.test(squash)) return TPA_OPTIONS.WESTHILL;
+        if (/contractorcon|contractercon|crawford/.test(squash)) return TPA_OPTIONS.CC;
+        if (/servprocom|servprohq|headquarter|callcenter|priorityresponse|1800servpro|800servpro/.test(squash) || /\bhq\b|\bcorporate\b/.test(text)) return TPA_OPTIONS.HQ;
+        // A SERVPRO HQ reference number on the key also means HQ sent the job
+        const ref = cleanValue(hqRefRaw).toLowerCase();
+        if (ref && !/^(no|n|none|false|0)$/.test(ref)) return TPA_OPTIONS.HQ;
+        return null;
+    }
+
     // --- Referred By mapping (shared) ---
     function mapReferredBy(referredByRaw) {
         let referredBy = "Advertising - Other";
@@ -1020,16 +1271,14 @@ function setPlainTextBox(id, value) {
             referredBy = "Advertising - Other";
         } else if (refLower.includes("hq") || refLower.includes("servpro hq")) {
             referredBy = "SERVPRO® Franchise Referral";
-        } else if (refLower.includes("servpro.com") || refLower.includes("servpro,com") || refLower.includes("google") || refLower.includes("chatgpt")) {
+        } else if (/servpro[.,]com|google|chatgpt|\bbing\b|yahoo|duckduckgo|\bweb\s*site\b|website|\bsearch\b|\bonline\b|internet|\byelp\b|nextdoor|\bangi\b|facebook|\bgemini\b|copilot|\bsiri\b|\balexa\b/.test(refLower)) {
             referredBy = "Internet/Web Search";
-        } else if (refLower.includes("insurance agent")) {
+        } else if (refLower.includes("insurance agent") || (refLower.includes("agent") && refLower.includes("ins"))) {
             referredBy = "Insurance Agent";
-        } else if (refLower.includes("insurance adjuster")) {
+        } else if (refLower.includes("adjuster")) {
             referredBy = "Insurance Adjuster";
-        } else if (refLower.includes("existing")) {
+        } else if (/existing|repeat|previous|prior|past customer|returning|used (us|servpro) before|worked with/.test(refLower)) {
             referredBy = "Existing Relationship";
-        } else if (refLower.includes("online") || refLower.includes("internet")) {
-            referredBy = "Internet/Web Search";
         } else {
             referredBy = "Advertising - Other";
         }
@@ -1039,15 +1288,6 @@ function setPlainTextBox(id, value) {
     // ==========================================
     //  CREATEJOB.ASPX HELPER FUNCTIONS (Telerik RadComboBox)
     // ==========================================
-    const userModifiedFields = new Set();
-
-    function getParticipantLabel(comboBoxElement) {
-        const parentTable = comboBoxElement.closest('table[style="width: 100%;"]');
-        if (!parentTable) return null;
-        const labelSpan = parentTable.querySelector('.DashLabelFontStyle');
-        return labelSpan ? labelSpan.textContent.trim() : null;
-    }
-
     // Trigger the page's own ZIP->Country/State/County lookup
     function triggerZipBind(zipFieldId) {
         let el = document.getElementById(zipFieldId);
@@ -1057,11 +1297,6 @@ function setPlainTextBox(id, value) {
         } else {
             el.dispatchEvent(new Event('blur', { bubbles: true }));
         }
-    }
-
-    function isCompensationPlanDropdown(comboBoxElement) {
-        const id = comboBoxElement.id || '';
-        return id.includes('CompensationPlanComboBox');
     }
 
     function getCurrentDropdownValue(comboBoxElement) {
@@ -1084,26 +1319,23 @@ function setPlainTextBox(id, value) {
         return comboBoxElement.offsetParent !== null;
     }
 
-    function setDropdownValue(comboBoxElement, value, text, forceUpdate = false, retryCount = 0) {
+    function setDropdownValue(comboBoxElement, value, text, _forceUpdate = true, retryCount = 0) {
         const maxRetries = 3;
         const retryDelay = 300;
         const inputEl = comboBoxElement.querySelector('input.rcbInput');
         const hiddenField = comboBoxElement.querySelector('input[type="hidden"][name*="_ClientState"]');
         if (!inputEl || !hiddenField) {
             if (retryCount < maxRetries) {
-                setTimeout(() => setDropdownValue(comboBoxElement, value, text, forceUpdate, retryCount + 1), retryDelay);
+                setTimeout(() => setDropdownValue(comboBoxElement, value, text, _forceUpdate, retryCount + 1), retryDelay);
                 return false;
             }
             return false;
         }
         if (!isDropdownReady(comboBoxElement) && retryCount < maxRetries) {
-            setTimeout(() => setDropdownValue(comboBoxElement, value, text, forceUpdate, retryCount + 1), retryDelay);
+            setTimeout(() => setDropdownValue(comboBoxElement, value, text, _forceUpdate, retryCount + 1), retryDelay);
             return false;
         }
         const fieldId = inputEl.id || inputEl.name;
-        if (!forceUpdate && userModifiedFields.has(fieldId)) {
-            return true;
-        }
         inputEl.value = text;
         if (value === '' || text === 'Select') {
             hiddenField.value = JSON.stringify({ logEntries: [], value: '', text: '', enabled: true, checkedIndices: [], checkedItemsTextOverflows: false });
@@ -1116,22 +1348,6 @@ function setPlainTextBox(id, value) {
         hiddenField.dispatchEvent(new Event('change', { bubbles: true }));
         console.log(`✓ Set ${fieldId} → ${text}`);
         return true;
-    }
-
-    function waitForDropdownsReady(context, callback, timeout = 5000) {
-        const startTime = Date.now();
-        function checkReady() {
-            const dropdowns = context.querySelectorAll('div[id*="EstimatorComboBox"].RadComboBox, div[id*="Estimator"].RadComboBox');
-            if (dropdowns.length === 0) {
-                if (Date.now() - startTime < timeout) { setTimeout(checkReady, 200); return; }
-                callback(); return;
-            }
-            let readyCount = 0;
-            dropdowns.forEach(d => { if (!isCompensationPlanDropdown(d) && isDropdownReady(d)) readyCount++; });
-            if (readyCount > 0 || Date.now() - startTime >= timeout) { callback(); }
-            else { setTimeout(checkReady, 200); }
-        }
-        checkReady();
     }
 
     // Find a RadComboBox client-side item by visible text (exact, then fuzzy)
@@ -1171,24 +1387,6 @@ function setPlainTextBox(id, value) {
         }
         console.log(`✗ No match found for "${text}" in #${comboBoxElement.id}`);
         return false;
-    }
-
-    function setRadComboByTextWithRetry(elementId, text, attempts = 10, delay = 300) {
-        return new Promise((resolve) => {
-            if (!text) return resolve(false);
-            let tries = 0;
-            let tryFn = () => {
-                let el = document.getElementById(elementId);
-                if (el && isDropdownReady(el)) {
-                    let ok = setRadComboByText(el, text, true);
-                    if (ok) return resolve(true);
-                }
-                tries++;
-                if (tries < attempts) setTimeout(tryFn, delay);
-                else { console.log(`✗ Gave up on #${elementId} -> "${text}"`); resolve(false); }
-            };
-            tryFn();
-        });
     }
 
     // LOAD-ON-DEMAND combos (ReportedBy, ReferredBy, CustomCode, LossType, SecondaryLossType, Estimator, InsuranceCarrier):
@@ -1295,77 +1493,253 @@ function setPlainTextBox(id, value) {
         }
     }
 
- // Word-boundary Cause of Loss -> Source of Loss matcher
-function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
-    const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-    const text = norm(causeOfLossRaw);
-    const typeLower = (typeOfLossRaw || "").toLowerCase();
+    // Cause of Loss -> Source of Loss matcher. Tiers, most reliable first:
+    //   1. a full option phrase found as whole words (longest first), upgraded to a longer option when the text
+    //      also contains its extra words ("supply line under the sink" -> "Sink Supply Line")
+    //   2. specific synonyms that the option list doesn't spell out ("burst pipe" -> Pipe Break)
+    //   3. word coverage: >= 60% of an option's words present, at least one of them non-generic
+    //   4. broad single-word synonyms ("tree", "roof", "window" ...)
+    //   5. "Unknown" when the caller said so
+    function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
+        const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+        const text = norm(causeOfLossRaw);
+        const typeLower = (typeOfLossRaw || "").toLowerCase();
 
-    // Duct cleaning jobs are the one place HVAC is a safe default
-    if (typeLower.includes("duct")) return "HVAC";
-    if (!text) return null;
+        // Duct cleaning jobs are the one place HVAC is a safe default
+        if (typeLower.includes("duct")) return "HVAC";
+        if (!text) return null;
 
-    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const wordRe = phrase => new RegExp('\\b' + esc(phrase).replace(/\s+/g, '\\s+') + 's?\\b');
+        const stem = w => w.replace(/(ing|ed|es|s)$/, '');
+        const skip = new Set(["other", "unknown"]);
+        const stop = new Set(["the","a","an","of","from","to","and","in","on","it","is","was","has","been","yes","no","not","resolved","unknown"]);
+        const generic = new Set(["water","leak","line","supply","drain","system","pipe","unit"]);
+        const textWords = new Set(text.split(' ').filter(w => w && !stop.has(w)).map(stem));
+        const optWordsOf = opt => norm(opt).split(' ').filter(Boolean).map(stem);
+        // "toilet overflow" also matches "toilets overflowed" / "roof leaking"
+        const wordRe = phrase => new RegExp('\\b' + norm(phrase).split(' ').map(w => escapeRe(w) + '(?:s|es|ed|ing)?').join('\\s+') + '\\b');
 
-    // 1. Explicit synonyms (word-boundary regexes, most specific first)
-    const synonyms = [
-        [/\b(air\s*)?duct(work|s)?\b|\bduct cleaning\b/, "HVAC"],
-        [/\bdryer vent\b/, "Dryer Vent"],
-        [/\b(hvac|a\s?c|air conditioning)\b/, "HVAC"],
-        [/\b(burst|broken|busted)\s+pipe\b|\bpipe\s+(burst|broke)/, "Pipe Break"],
-        [/\bfrozen\s+pipe/, "Frozen Pipe Burst"],
-        [/\bsewage\b|\bsewer\b/, "Sewer"],
-        [/\bwasher\b/, "Washing Machine"],
-        [/\bwater heater\b|\bhot water tank\b/, "Water Heater"],
-        [/\bsump\b/, "Sump Pump Failure"]
-    ];
-    for (let [re, opt] of synonyms) {
-        if (re.test(text)) return opt;
-    }
+        // Best option by (coverage, non-generic hits, hits). mustContain = words the option must extend (phrase upgrade).
+        const bestByCoverage = (minCoverage, mustContain) => {
+            let best = null, bestKey = [0, 0, 0];
+            for (let opt of sourceOfLossOptions) {
+                if (skip.has(opt.toLowerCase())) continue;
+                const optWords = optWordsOf(opt);
+                const hits = optWords.filter(w => textWords.has(w));
+                if (!hits.length || hits.every(w => generic.has(w))) continue;
+                if (mustContain) {
+                    if (!(optWords.length > mustContain.length && mustContain.every(w => optWords.includes(w)))) continue;
+                    if (!hits.some(w => !mustContain.includes(w))) continue;        // must be supported by an EXTRA word from the text
+                }
+                const coverage = hits.length / optWords.length;
+                if (coverage < minCoverage) continue;
+                const key = [coverage, hits.filter(w => !generic.has(w)).length, hits.length];
+                if (key[0] > bestKey[0] || (key[0] === bestKey[0] && (key[1] > bestKey[1] || (key[1] === bestKey[1] && key[2] > bestKey[2])))) {
+                    best = opt; bestKey = key;
+                }
+            }
+            return best;
+        };
 
-    // 2. Full option phrase found as whole words (longest option first)
-    const skip = new Set(["other", "unknown"]);
-    const byLength = [...sourceOfLossOptions]
-        .filter(o => !skip.has(o.toLowerCase()))
-        .sort((a, b) => b.length - a.length);
-    for (let opt of byLength) {
-        if (wordRe(norm(opt)).test(text)) return opt;
-    }
-
-    // 3. Strict word coverage: >=60% of the option's words present, with at least one non-generic word
-    const stop = new Set(["the","a","an","of","from","to","and","in","on","it","is","was","has","been","yes","no","not","resolved","unknown"]);
-    const generic = new Set(["water","leak","line","supply","drain","system","pipe","unit"]);
-    const stem = w => w.replace(/s$/, '');
-    const textWords = new Set(text.split(' ').filter(w => w && !stop.has(w)).map(stem));
-
-    let best = null, bestCoverage = 0, bestHits = 0;
-    for (let opt of sourceOfLossOptions) {
-        if (skip.has(opt.toLowerCase())) continue;
-        const optWords = norm(opt).split(' ').filter(Boolean).map(stem);
-        const hits = optWords.filter(w => textWords.has(w));
-        if (!hits.length || hits.every(w => generic.has(w))) continue;
-        const coverage = hits.length / optWords.length;
-        if (coverage >= 0.6 && (coverage > bestCoverage || (coverage === bestCoverage && hits.length > bestHits))) {
-            best = opt; bestCoverage = coverage; bestHits = hits.length;
+        // 1. Full option phrase (longest first)
+        const byLength = [...sourceOfLossOptions].filter(o => !skip.has(o.toLowerCase())).sort((a, b) => b.length - a.length);
+        for (let opt of byLength) {
+            if (wordRe(opt).test(text)) return bestByCoverage(2 / 3, optWordsOf(opt)) || opt;
         }
+
+        // 2. Specific synonyms (word-boundary, most specific first)
+        const specificSynonyms = [
+            [/\b(air\s*)?duct(work|s)?\b|\bduct cleaning\b/, "HVAC"],
+            [/\bdryer vent\b/, "Dryer Vent"],
+            [/\b(hvac|a\s?c|air conditioning|air conditioner)\b/, "HVAC"],
+            [/\b(burst|broken|busted|cracked)\s+(water\s+)?pipe\b|\bpipe\s+(burst|broke|crack)/, "Pipe Break"],
+            [/\bfrozen\s+pipe/, "Frozen Pipe Burst"],
+            [/\bsewage\b|\bsewer\b|\bseptic\b/, "Sewer"],
+            [/\bwasher\b/, "Washing Machine"],
+            [/\bwater heater\b|\bhot water tank\b/, "Water Heater"],
+            [/\bsump\b/, "Sump Pump Failure"],
+            [/\bice\s?maker\b/, "Ice Maker Supply Line"],
+            [/\bfridge\b/, "Refrigerator"],
+            [/\bdisposal\b/, "Garbage Disposal"],
+            [/\bwax ring\b/, "Toilet"],
+            [/\bslab\b/, "Slab LeaK"],
+            [/\bground\s?water\b|\bsurface water\b|\bseep(age|ing)?\b/, "Ground Surface Water"],
+            [/\b(wind|storm)[\s-]*driven rain\b/, "Wind-Driven Rain"],
+            [/\bice dam\b/, "Snow"],
+            [/\b(kitchen|grease|cooking|stove|oven) fire\b|\bstove\b|\boven\b/, "Stove Oven"],
+            [/\b(car|truck|vehicle|auto)\b.*\b(hit|struck|crash|impact|into)\b/, "Vehicle Impact"],
+            [/\bwater main\b|\bmain line\b/, "Water Main"],
+            [/\bback(ed)?\s?up\b/, "Drain Backup"]
+        ];
+        for (let [re, opt] of specificSynonyms) if (re.test(text)) return opt;
+
+        // 3. Word coverage
+        const covered = bestByCoverage(0.6, null);
+        if (covered) return covered;
+
+        // 4. Broad single-word synonyms
+        const broadSynonyms = [
+            [/\bbath\s?tub\b|\btub\b/, "Bath tub"],
+            [/\bflood/, "Flood"],
+            [/\bwind\b|\bwindy\b/, "Strong Winds"],
+            [/\bsnow\b/, "Snow"],
+            [/\btree\b/, "Tree"],
+            [/\broof/, "Roof Leak"],
+            [/\bwindow/, "Window Leak"],
+            [/\bdoor/, "Door Leak"],
+            [/\bclog/, "Clogged Drain"],
+            [/\bhose\b/, "Hose Bib"],
+            [/\belectric|\bwiring\b|\boutlet\b/, "Electrical"],
+            [/\bsmok(e|ing)\b|\bcigar/, "Cigarette"],
+            [/\bvandal/, "Vandalism"],
+            [/\brain\b/, "Wind-Driven Rain"]
+        ];
+        for (let [re, opt] of broadSynonyms) if (re.test(text)) return opt;
+
+        // 5. The caller said they don't know -> "Unknown" rather than "Other"
+        if (/\bunknown\b|\bunsure\b|\bnot sure\b|\bdon'?t know\b|\bno idea\b|\bundetermined\b/.test(text)) return "Unknown";
+        return null;
     }
-    return best;
-}
+
+    // ==========================================
+    //  WORKCENTER CAUSE OF LOSS (cascades from Loss Type)
+    //  Option lists dumped from ddCauseOfLoss on the live page (Oct 2026). Re-dump if WorkCenter changes them.
+    // ==========================================
+    const WC_CAUSE_OF_LOSS = {
+        "Biohazard":        ["Death","Injury","Other","Sharps","Waste"],
+        "Contents":         ["Biohazard","Fire","Mold","Other","Reconstruction","Sewage","Smoke","Water"],
+        "Fire":             ["Candle","Dishwasher","Electrical Malfunction","Grease","Lightning","Other","Other Appliance","Puff Back-Furnace","Refrigerator","Stove/Oven","Unknown","Washing Machine","Wildfires"],
+        "Fire/Water":       ["Candle","Dishwasher","Electrical Malfunction","Grease","Lightning","Other","Other Appliance","Puff Back-Furnace","Refrigerator","Stove/Oven","Unknown","Washing Machine","Wildfires"],
+        "General Cleaning": ["Other","Pathogen/CSC"],
+        "Liability":        ["AC Leak","Other","Other Appliance","Refrigerator","Stove/Oven","Washing Machine","Water Heater"],
+        "Mold":             ["AC Leak","Flood","Hurricane","Ice Storm","Mildew","Other","Other Weather","Pipe","Roof Leak","Slab Leak","Sump Pump Failure","Toilet","Tornado","Unknown","Water Heater","Wind"],
+        "Odor":             ["Animal","Electrical Malfunction","Grease","Mildew","Other","Sewage Back-up","Stain on Carpet","Unknown"],
+        "Other":            ["Other"],
+        "Reconstruction":   ["Biohazard","Fire","Mold","Other","Sewage","Smoke","Water"],
+        "Roofing":          ["Fire","Hail","Impact","Snow/Ice","Vandalism","Wind"],
+        "Sewage":           ["AC Leak","Flood","Hurricane","Ice Storm","Mildew","Other","Other Weather","Pipe","Roof Leak","Slab Leak","Sump Pump Failure","Toilet","Tornado","Tree Roots","Unknown","Water Heater","Wind"],
+        "Smoke":            ["Candle","Dishwasher","Electrical Malfunction","Grease","Lightning","Other","Other Appliance","Puff Back-Furnace","Refrigerator","Stove/Oven","Unknown","Washing Machine","Wildfires"],
+        "Tree Removal":     ["Other"],
+        "Vandalism":        ["Other","Unknown"],
+        "Water":            ["AC Leak","Flood","Hurricane","Ice Storm","Mildew","Other","Other Weather","Pipe","Roof Leak","Slab Leak","Sump Pump Failure","Toilet","Tornado","Unknown","Water Heater","Wind"]
+    };
+
+    // Synonyms for the WorkCenter options. ORDER = PRIORITY when several match within one list
+    // ("water heater supply line" must hit Water Heater before Pipe; "roof leak after storm" Roof Leak before Other Weather).
+    const WC_CAUSE_SYNONYMS = [
+        ["Sump Pump Failure",      /\bsump\b/],
+        ["Water Heater",           /\bwater heater\b|\bhot water (tank|heater)\b/],
+        ["AC Leak",                /\bhvac\b|\ba\s?\/?\s?c\b|\bair condition|\bcondensat|\bdrain pan\b|\bmini[\s-]?split\b/],
+        ["Slab Leak",              /\bslab\b/],
+        ["Roof Leak",              /\broof/],
+        ["Toilet",                 /\btoilet|\bwax ring\b|\bcommode\b/],
+        ["Dishwasher",             /\bdishwasher\b/],
+        ["Washing Machine",        /\bwashing machine\b|\bwasher\b|\blaundry\b/],
+        ["Refrigerator",           /\bfridge\b|\brefrigerator\b|\bfreezer\b|\bice\s?maker\b/],
+        ["Stove/Oven",             /\bstove\b|\boven\b|\brange\b|\bcooktop\b|\bburner\b|\bkitchen fire\b/],
+        ["Grease",                 /\bgrease\b|\bcooking\b|\bfryer\b/],
+        ["Candle",                 /\bcandle\b/],
+        ["Puff Back-Furnace",      /\bpuff\s?back\b|\bfurnace\b|\bboiler\b|\boil burner\b/],
+        ["Lightning",              /\blightning\b/],
+        ["Wildfires",              /\bwild\s?fire|\bbrush fire\b|\bforest fire\b/],
+        ["Electrical Malfunction", /\belectric|\bwiring\b|\boutlet\b|\bbreaker\b|\bshort(ed)?\b|\bextension cord\b|\bpower strip\b|\bpanel\b/],
+        ["Other Appliance",        /\bdryer\b|\bmicrowave\b|\btoaster\b|\bspace heater\b|\bappliance\b|\bheater\b|\bdehumidifier\b|\bhumidifier\b/],
+        ["Tree Roots",             /\btree root|\broots?\b/],
+        ["Sewage Back-up",         /\bsewage\b|\bsewer\b|\bseptic\b/],
+        ["Sewage",                 /\bsewage\b|\bsewer\b|\bseptic\b/],
+        ["Flood",                  /\bflood/],
+        ["Hurricane",              /\bhurricane\b|\btropical storm\b/],
+        ["Tornado",                /\btornado\b/],
+        ["Ice Storm",              /\bice storm\b|\bice dam\b|\bice\b(?!\s?maker)/],
+        ["Snow/Ice",               /\bsnow\b|\bice\b|\bfreez/],
+        ["Hail",                   /\bhail\b/],
+        ["Wind",                   /\bwind\b|\bwindy\b|\bgust/],
+        ["Impact",                 /\bimpact\b|\btree\b|\bfell\b|\bfall(en|ing)?\b|\bhit\b|\bstruck\b|\bdebris\b|\bvehicle\b|\bcar\b/],
+        ["Vandalism",              /\bvandal|\bbreak[\s-]?in\b|\bburglar/],
+        ["Mildew",                 /\bmildew\b|\bmusty\b/],
+        ["Animal",                 /\banimal\b|\bpet\b|\bdog\b|\bcat\b|\brodent\b|\bmouse\b|\bmice\b|\brats?\b|\braccoon\b|\bskunk\b|\burine\b|\bdead\b/],
+        ["Stain on Carpet",        /\bstain|\bcarpet\b/],
+        ["Death",                  /\bdeath\b|\bdeceased\b|\bpassed away\b|\bbody\b|\bdecomp|\bsuicide\b|\bhomicide\b|\bunattended\b/],
+        ["Sharps",                 /\bsharps?\b|\bneedle|\bsyringe/],
+        ["Injury",                 /\binjur|\bblood\b|\baccident\b|\btrauma\b|\bcrime scene\b/],
+        ["Waste",                  /\bwaste\b|\bfeces\b|\bhoard|\bbio\s?hazard\b/],
+        ["Pathogen/CSC",           /\bpathogen|\bcovid\b|\bvirus|\bdisinfect|\bsanitiz|\bcsc\b/],
+        ["Biohazard",              /\bbio\s?hazard\b|\btrauma\b/],
+        ["Fire",                   /\bfire\b/],
+        ["Smoke",                  /\bsmoke\b|\bsoot\b/],
+        ["Mold",                   /\bmold\b/],
+        ["Water",                  /\bwater\b|\bleak|\bpipe|\bflood|\bburst\b/],
+        ["Pipe",                   /\bpipe|\bsupply line\b|\bwater line\b|\bplumbing\b|\bburst\b|\bvalve\b|\bfitting\b|\bhose\b|\bline\b|\bdrain\b|\bleak|\bfrozen\b|\bback(ed)?[\s-]?up\b|\bclog|\bsewer\b/],
+        ["Other Weather",          /\bstorm\b|\brain\b|\bweather\b|\bsnow\b|\bhail\b|\blightning\b/],
+        ["Unknown",                /\bunknown\b|\bunsure\b|\bnot sure\b|\bdon'?t know\b|\bno idea\b|\bundetermined\b|\btbd\b/]
+    ];
+
+    // Which WC_CAUSE_OF_LOSS list applies to a Loss Type text ("Water", "Water Damage", "Fire/Smoke", "Storm"...)
+    function wcCauseListFor(lossTypeText) {
+        const t = (lossTypeText || "").toLowerCase().trim();
+        if (!t) return null;
+        const keys = Object.keys(WC_CAUSE_OF_LOSS);
+        let key = keys.find(k => k.toLowerCase() === t)
+               || keys.slice().sort((a, b) => b.length - a.length).find(k => new RegExp('\\b' + escapeRe(k.toLowerCase()) + '\\b').test(t));
+        if (!key && /\bstorm\b|\bflood\b/.test(t)) key = "Water";
+        if (!key && /\bbio\b/.test(t)) key = "Biohazard";
+        return key ? { key, options: WC_CAUSE_OF_LOSS[key] } : null;
+    }
+
+    // Cause of Loss text -> the WorkCenter option valid for this Loss Type, or null (caller falls back to "Other")
+    function matchWorkCenterCauseOfLoss(causeOfLossRaw, lossTypeText) {
+        const list = wcCauseListFor(lossTypeText);
+        if (!list) return null;
+        const text = (causeOfLossRaw || "").toLowerCase().replace(/[^a-z0-9\s\/'-]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!text) return null;
+        const has = o => list.options.some(x => x.toLowerCase() === o.toLowerCase());
+
+        // 1. The option's own wording appears in the text ("sump pump failure", "slab leak", "stove/oven")
+        for (const opt of list.options.slice().sort((a, b) => b.length - a.length)) {
+            if (/^(other|unknown)$/i.test(opt)) continue;
+            const re = new RegExp('\\b' + opt.toLowerCase().split(/[\s\/-]+/).map(escapeRe).join('[\\s\\/-]+') + '(?:s|es|ed|ing)?\\b');
+            if (re.test(text)) return opt;
+        }
+        // 2. Synonyms, in priority order, restricted to the options this Loss Type offers
+        for (const [opt, re] of WC_CAUSE_SYNONYMS) {
+            if (has(opt) && re.test(text)) return opt;
+        }
+        return null;
+    }
+
+    // Wait for a cascading Kendo dropdown to list `text` (its options reload after the parent dropdown changes), then select it
+    async function setKendoDropdownWhenLoaded(elementId, text, timeout = 5000) {
+        if (!window.jQuery || !text) return false;
+        const target = String(text).toLowerCase().trim();
+        const start = Date.now();
+        while (Date.now() - start < timeout) {
+            const el = window.jQuery('#' + elementId);
+            const widget = el.data('kendoDropDownList') || el.data('kendoComboBox');
+            if (widget && widget.dataSource) {
+                const tField = widget.options.dataTextField;
+                const texts = widget.dataSource.data().map(d => typeof d === 'string' ? d
+                    : String((tField && d[tField]) || d.Name || d.name || d.Text || d.text || d.Description || '')).map(s => s.toLowerCase().trim());
+                if (texts.includes(target)) return setKendoDropdownExact(elementId, text);
+            }
+            await sleep(250);
+        }
+        console.log(`✗ #${elementId} never listed "${text}" within ${timeout}ms`);
+        return false;
+    }
 
     // ==========================================
     //  WORKCENTER (intake) AUTOFILL
     // ==========================================
     function autofillWorkCenter(data) {
         const callerName = data[COLUMN.CallerName] || "";
+        const callerParts = splitName(callerName);
         const propertyType = data[COLUMN.PropertyType] || "";
         const bizName = data[COLUMN.BusinessName] || "";
-        let lossAddressRaw = data[COLUMN.LossAddress] || "";
-        let billingAddressRaw = data[COLUMN.BillingAddress] || "";
-        const phone = data[COLUMN.Phone] || "";
-        const email = data[COLUMN.Email_Field] || "";
+        const phoneDigits = extractPhone(data[COLUMN.Phone]) || extractPhone(data[COLUMN.AdditionalPhone]);
+        const phone = formatPhoneParens(phoneDigits);
+        const email = extractEmail(data[COLUMN.Email_Field]) || extractEmail(data[COLUMN.SecondaryEmail]);
         const typeOfLoss = data[COLUMN.TypeOfLoss] || "";
         const dateOfLossRaw = data[COLUMN.DateOfLoss] || "";
+        const causeOfLoss = data[COLUMN.CauseOfLoss] || "";
         const reportedByRaw = data[COLUMN.ReportedBy] || "";
         const referredByRaw = data[COLUMN.ReferredBy] || "";
         const selfPayOrIns = data[COLUMN.SelfPayOrIns] || "";
@@ -1374,15 +1748,13 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
         let scheduledPMRaw = data[COLUMN.ScheduledPM] || "";
         const scheduledPM = scheduledPMRaw.trim() === "" ? "**NOT ASSIGNED**" : scheduledPMRaw;
         const arrivalDateRaw = data[COLUMN.ArrivalDate] || "";
-        const arrivalTimeRaw = data[COLUMN.ArrivalTime] || "";
 
-        if (lossAddressRaw.toLowerCase().includes("same as customer") || lossAddressRaw.toLowerCase().includes("same as billing")) {
-            lossAddressRaw = billingAddressRaw;
-        }
-
-        // Determine whether Billing Address should mirror the Loss Address.
-        // Drives the "Same as Caller" (Customer) -> "Same as Customer" (Loss Address) sequence below.
-        const billingSameAsLossAddress = billingAddressRaw.toLowerCase().includes("same as loss") || billingAddressRaw.trim() === "";
+        // Loss / Billing resolved the same way on both pages ("same as ..." in either field, blank billing = same as loss).
+        // billingSameAsLossAddress drives the "Same as Caller" (Customer) -> "Same as Customer" (Loss Address) sequence below.
+        const addresses = resolveAddressPair(data[COLUMN.LossAddress], data[COLUMN.BillingAddress]);
+        const lossAddressRaw = addresses.loss;
+        const billingAddressRaw = addresses.billing;
+        const billingSameAsLossAddress = addresses.billingSameAsLoss;
 
 
 
@@ -1394,7 +1766,8 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
         const referredBy = mapReferredBy(referredByRaw);
 
         console.log("=== WC DEBUG INFO ===");
-        console.log("callerName:", callerName, "selfPayOrIns:", selfPayOrIns, "scheduledPM:", scheduledPM);
+        console.log("callerName:", callerName, "->", callerParts, "phone:", phone, "email:", email, "selfPayOrIns:", selfPayOrIns, "scheduledPM:", scheduledPM);
+        console.log("addresses:", addresses);
         console.log("referredByRaw:", referredByRaw, "-> referredBy:", referredBy);
         console.log("reportedByRaw:", reportedByRaw, "-> reportedBy:", reportedBy);
 
@@ -1424,7 +1797,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
                 setKOValue('#callerPostalCode', parsedAddress.zip, true);
                 await sleep(700);   // let any zip-triggered lookup finish before city/state
                 setKOValue('#callerCity', parsedAddress.city, true);
-                setKendoDropdownExact('callerState', parsedAddress.state);
+                setKendoDropdownExact('callerState', stateCandidates(parsedAddress.state));
             })();
 
             // Franchise no longer depends on BOTH street and city parsing successfully
@@ -1445,7 +1818,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
             }
 
             if (window.jQuery) {
-                let lossDateJS = excelDateToJSDate(parseFloat(dateOfLossRaw));
+                let lossDateJS = parseDataDate(dateOfLossRaw);
                 let dolPicker = window.jQuery("input[data-bind*='DateOfLoss']").data("kendoDateTimePicker");
                 if (dolPicker && lossDateJS) { dolPicker.value(lossDateJS); dolPicker.trigger("change"); }
             }
@@ -1453,7 +1826,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
 
         // --- Execution Step 3: Loss Characteristics & Site Appointment ---
         setTimeout(() => {
-            let baseArrivalDate = excelDateToJSDate(parseFloat(arrivalDateRaw));
+            let baseArrivalDate = parseDataDate(arrivalDateRaw);
             if (baseArrivalDate) {
                 let beginDate = new Date(baseArrivalDate); beginDate.setHours(0, 0, 0, 0);
                 let endDate = new Date(baseArrivalDate); endDate.setHours(0, 0, 0, 0);
@@ -1467,7 +1840,19 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
 
             setKendoDropdownExact('ddlLostType2', typeOfLoss);
             setKendoDropdownExact('byDD', scheduledPM);
-            setKendoDropdownExact('ddCauseOfLoss', 'Other');
+
+            // Cause of Loss cascades from Loss Type: match against the list for the Loss Type that is actually
+            // selected, and only commit once the dropdown has reloaded with that list.
+            (async () => {
+                const ltEl = window.jQuery('#ddlLostType2');
+                const ltWidget = ltEl.data('kendoDropDownList') || ltEl.data('kendoComboBox');
+                let selectedLossType = (ltWidget && typeof ltWidget.text === 'function') ? (ltWidget.text() || "") : "";
+                if (!selectedLossType || /select/i.test(selectedLossType)) selectedLossType = typeOfLoss;
+                const wcCause = matchWorkCenterCauseOfLoss(causeOfLoss, selectedLossType) || 'Other';
+                console.log("WC Cause of Loss:", causeOfLoss, "| Loss Type:", selectedLossType, "->", wcCause);
+                const ok = await setKendoDropdownWhenLoaded('ddCauseOfLoss', wcCause, 5000);
+                if (!ok && wcCause !== 'Other') setKendoDropdownExact('ddCauseOfLoss', 'Other');
+            })();
         }, 2200);
 
         // --- Execution Step 4: Insurance Details & Claim Number ---
@@ -1509,7 +1894,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
         setTimeout(() => {
             let callerInput = document.getElementById("autoCompleteCallerContact");
             if (callerInput) {
-                callerInput.value = callerName;
+                callerInput.value = callerParts.full || callerName;
                 callerInput.dispatchEvent(new Event("input", { bubbles: true }));
                 callerInput.dispatchEvent(new Event("change", { bubbles: true }));
             }
@@ -1528,8 +1913,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
             let dialog = window.jQuery("#callSourceDialog");
             if (dialog.length && dialog.is(":visible")) {
                 clearInterval(callDialogInterval);
-                let cleanTargetPhone = phone.replace(/\D/g, '');
-                if (cleanTargetPhone.length > 10) cleanTargetPhone = cleanTargetPhone.slice(-10);
+                let cleanTargetPhone = phoneDigits;
                 let matched = false;
 
                 let rows = dialog.find("table tbody tr");
@@ -1570,35 +1954,24 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
             if (dialogNode && window.jQuery(dialogNode).is(":visible")) {
                 clearInterval(contactDialogInterval);
 
-                let formattedPhone = phone;
-                let cleanPhone = phone.replace(/\D/g, '');
-                if (cleanPhone.length === 10) {
-                    formattedPhone = `(${cleanPhone.substring(0,3)}) ${cleanPhone.substring(3,6)}-${cleanPhone.substring(6,10)}`;
-                } else if (cleanPhone === "") {
-                    formattedPhone = "";
-                }
-
-                let contactAddressRaw = billingAddressRaw;
-                if (billingAddressRaw.toLowerCase().includes("same as loss") || billingAddressRaw === "") {
-                    contactAddressRaw = lossAddressRaw;
-                }
+                let formattedPhone = phone;                 // already "(804) 555-1234" or ""
+                let contactAddressRaw = billingAddressRaw;  // resolveAddressPair already substituted the loss address when billing was blank / "same as loss"
 
                 setTimeout(() => {
+                    // Same First / Last split as CreateJob (last word = last name; prefixes, suffixes and "(role)" stripped)
                     let firstNameEl = document.getElementById('txtFirstName');
                     if (firstNameEl) {
-                        let names = callerName.split(" ");
-                        firstNameEl.value = names[0];
+                        firstNameEl.value = callerParts.first;
                         let koData = window.ko.dataFor(firstNameEl);
-                        if (koData && typeof koData.FirstName === 'function') koData.FirstName(names[0]);
+                        if (koData && typeof koData.FirstName === 'function') koData.FirstName(callerParts.first);
                         window.jQuery(firstNameEl).trigger('input').trigger('change');
                     }
 
                     let lastNameEl = document.getElementById('txtLastName');
                     if (lastNameEl) {
-                        let names = callerName.split(" ");
-                        lastNameEl.value = names.slice(1).join(" ");
+                        lastNameEl.value = callerParts.last;
                         let koData = window.ko.dataFor(lastNameEl);
-                        if (koData && typeof koData.LastName === 'function') koData.LastName(names.slice(1).join(" "));
+                        if (koData && typeof koData.LastName === 'function') koData.LastName(callerParts.last);
                         window.jQuery(lastNameEl).trigger('input').trigger('change');
                     }
 
@@ -1636,7 +2009,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
                         window.jQuery(zipEl).trigger('input').trigger('change');
                     }
 
-                    if (parsedAddress.state) setKendoDropdownExact('contactStateDD', parsedAddress.state);
+                    if (parsedAddress.state) setKendoDropdownExact('contactStateDD', stateCandidates(parsedAddress.state));
 
                     let addr2 = document.getElementById('lossAddress2');
                     if (addr2) {
@@ -1675,7 +2048,7 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
                 }, 350);
 
                 setTimeout(() => {
-                    if (email && email.trim() !== "" && email.includes("@")) {
+                    if (email) {
                         let emailInputs = document.querySelectorAll("#divConnections input[type='text']");
                         if (emailInputs.length > 0) {
                             let emailInput = emailInputs[0];
@@ -1754,11 +2127,13 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
     // ==========================================
     async function autofillCreateJob(data) {
         const callerName = data[COLUMN.CallerName] || "";
-        const phone = data[COLUMN.Phone] || "";
-        const email = data[COLUMN.Email_Field] || "";
+        const callerParts = splitName(callerName);
+        const phone = extractPhone(data[COLUMN.Phone]) || extractPhone(data[COLUMN.AdditionalPhone]);   // 10 digits or ""
+        const email = extractEmail(data[COLUMN.Email_Field]) || extractEmail(data[COLUMN.SecondaryEmail]);
         const propertyType = data[COLUMN.PropertyType] || "";
-        let lossAddressRaw = data[COLUMN.LossAddress] || "";
-        let billingAddressRaw = data[COLUMN.BillingAddress] || "";
+        const addresses = resolveAddressPair(data[COLUMN.LossAddress], data[COLUMN.BillingAddress]);
+        const lossAddressRaw = addresses.loss;
+        const billingAddressRaw = addresses.billing;
         const typeOfLoss = data[COLUMN.TypeOfLoss] || "";
         const dateOfLossRaw = data[COLUMN.DateOfLoss] || "";
         const causeOfLoss = data[COLUMN.CauseOfLoss] || "";
@@ -1771,29 +2146,19 @@ function matchSourceOfLoss(causeOfLossRaw, typeOfLossRaw) {
         let scheduledPMRaw = data[COLUMN.ScheduledPM] || "";
         const scheduledPM = scheduledPMRaw.trim() === "" ? "**NOT ASSIGNED**" : scheduledPMRaw;
 
-        if (lossAddressRaw.toLowerCase().includes("same as customer") || lossAddressRaw.toLowerCase().includes("same as billing")) {
-            lossAddressRaw = billingAddressRaw;
-        }
-
-let reportedBy = mapReportedBy(reportedByRaw);
-        // Commercial: if no clean match, default to Facility Manager rather than Other
-        if (propertyType.toLowerCase().includes('com') && reportedBy === "Other") {
-            reportedBy = "Facility Manager";
-        }
-        const referredBy = mapReferredBy(referredByRaw);
         const isSelfPay = selfPayOrIns.toLowerCase().includes('self');
 
         // ---- Customer Information (billing) + Job Address (loss) ----
-        // Split POC name into First / Last
-        let nameParts = (callerName || "").trim().split(/\s+/);
-        let custFirst = nameParts.length >= 2 ? nameParts.slice(0, -1).join(" ") : (nameParts[0] || "");
-        let custLast  = nameParts.length >= 2 ? nameParts[nameParts.length - 1] : "";
+        // POC name split (shared with WorkCenter): last word = last name, prefixes / suffixes / "(role)" stripped
+        let custFirst = callerParts.first;
+        let custLast  = callerParts.last;
 
         let lossParsed = parseAddress(lossAddressRaw);
-        let billingSame = (billingAddressRaw || "").toLowerCase().includes("same");
+        let billingSame = addresses.billingSameAsLoss;
 
-        // Customer (= billing). If billing is "same as loss", Customer gets the loss address.
+        // Customer (= billing). If billing is "same as loss" (or blank), Customer gets the loss address.
         let custAddr = billingSame ? lossParsed : parseAddress(billingAddressRaw);
+        console.log("CJ addresses:", addresses, "loss parsed:", lossParsed, "billing parsed:", custAddr);
 
         let isCommercial = propertyType.toLowerCase().includes('com');
         let bizName = data[COLUMN.BusinessName] || "";
@@ -1882,9 +2247,8 @@ let reportedBy = mapReportedBy(reportedByRaw);
         }
 
         console.log("=== CreateJob DEBUG INFO ===");
-        console.log("callerName (Job Name):", callerName);
-        console.log("reportedByRaw:", reportedByRaw, "-> reportedBy:", reportedBy);
-        console.log("referredByRaw:", referredByRaw, "-> referredBy:", referredBy);
+        console.log("callerName (Job Name):", callerName, "->", callerParts, "phone:", phone, "email:", email);
+        console.log("reportedByRaw:", reportedByRaw, "referredByRaw:", referredByRaw);
         console.log("typeOfLoss:", typeOfLoss, "causeOfLoss:", causeOfLoss);
         console.log("isSelfPay:", isSelfPay, "carrier:", insuranceCarrier, "claim#:", claimNum, "policy#:", policyNum);
         console.log("scheduledPM (Estimator):", scheduledPM);
@@ -1901,9 +2265,10 @@ let reportedBy = mapReportedBy(reportedByRaw);
         let lossCategoryEl = document.getElementById(CJ.LossCategory);
         if (lossCategoryEl && lossCategory) setRadComboByText(lossCategoryEl, lossCategory, true);
 
-        // 3. Date of Loss
-        let lossDateJS = excelDateToJSDate(parseFloat(dateOfLossRaw));
-        setRadDate(CJ.DateOfLoss, lossDateJS);
+        // 3. Date of Loss (Excel serial or a date string)
+        let lossDateJS = parseDataDate(dateOfLossRaw);
+        if (lossDateJS) setRadDate(CJ.DateOfLoss, lossDateJS);
+        else if (dateOfLossRaw) console.log(`⚠ Could not parse Date of Loss "${dateOfLossRaw}"`);
 
 // 4. Reported By / Referred By - LOAD ON DEMAND combos
         let reportedByCJ = mapReportedByCreateJob(reportedByRaw, isCommercial);
@@ -1963,9 +2328,9 @@ let reportedBy = mapReportedBy(reportedByRaw);
         }
 
         // 5. Zip-based lookups: Office Name (preloaded) + Custom Code (load-on-demand)
-        let parsedAddress = parseAddress(lossAddressRaw);
-        let franchiseKey = resolveFranchise(parsedAddress.zip, parsedAddress.city, data[COLUMN.EnvironmentalCode]);
-        console.log("Parsed loss address:", parsedAddress, "-> franchise:", franchiseKey);
+        let franchiseKey = resolveFranchise(lossParsed.zip, lossParsed.city, data[COLUMN.EnvironmentalCode]);
+        console.log("Parsed loss address:", lossParsed, "-> franchise:", franchiseKey);
+        if (!franchiseKey) console.log("⚠ No franchise resolved - Office / Custom Code left untouched");
 
         if (franchiseKey) {
             let group = officeGroupMap[franchiseKey];
@@ -1981,7 +2346,7 @@ let reportedBy = mapReportedBy(reportedByRaw);
 
         // 6. Loss Type & Secondary Loss Type - LOAD ON DEMAND, and they cascade from Loss Category,
         //    so give the page a moment after Loss Category was set before requesting items.
-        let lossTypeInfo = lossTypeMap[typeOfLoss.toLowerCase().trim()] || DEFAULT_LOSS_TYPE;
+        let lossTypeInfo = lookupByKeyword(lossTypeMap, typeOfLoss) || DEFAULT_LOSS_TYPE;
         await new Promise(r => setTimeout(r, 800));
         await setLoadOnDemandCombo(CJ.LossType, lossTypeInfo.lossType);
         await new Promise(r => setTimeout(r, 500));
@@ -2025,12 +2390,28 @@ if (scheduledPM !== "**NOT ASSIGNED**") {
             }
         }
 
+        // 9b. TPA Company (Alacrity / Westhill / SERVPRO HQ / Contractor Connection) from "How did you hear about SERVPRO?"
+        const tpa = mapTPA(referredByRaw, data[COLUMN.ServproHQRef]);
+        console.log("TPA Company:", referredByRaw, "->", tpa);
+        if (tpa) {
+            let tpaOk = await setLoadOnDemandCombo(CJ.TPACompany, tpa);
+            if (!tpaOk && TPA_KNOWN_VALUES[tpa]) {
+                let tpaEl = document.getElementById(CJ.TPACompany);
+                if (tpaEl) {
+                    setDropdownValue(tpaEl, TPA_KNOWN_VALUES[tpa], tpa, true);
+                    console.log(`✓ TPA Company set via known value (${tpa} / ${TPA_KNOWN_VALUES[tpa]})`);
+                    tpaOk = true;
+                }
+            }
+            if (!tpaOk) console.log(`✗ TPA Company "${tpa}" not found in the list - add its exact text to TPA_OPTIONS or its value to TPA_KNOWN_VALUES`);
+        }
+
         // 10. Policy Information: ONLY Claim Number + Policy Number
         if (claimNum) setRadTextBoxValue(CJ.ClaimNumber, claimNum);
         if (policyNum) setRadTextBoxValue(CJ.PolicyNumber, policyNum);
 
         // 11. Division checkboxes - based on Type of Loss
-        let divisionLabel = divisionMap[typeOfLoss.toLowerCase().trim()] || DEFAULT_DIVISION;
+        let divisionLabel = lookupByKeyword(divisionMap, typeOfLoss) || DEFAULT_DIVISION;
         let divCheckboxId = DIVISION_CHECKBOXES[divisionLabel];
         let divCheckbox = divCheckboxId ? document.getElementById(divCheckboxId) : null;
         if (divCheckbox && !divCheckbox.checked) {
@@ -2059,15 +2440,40 @@ if (scheduledPM !== "**NOT ASSIGNED**") {
     // ==========================================
     //  BUTTON CLICK -> ROUTE BY PAGE
     // ==========================================
+    let autofillRunning = false;
     btn.addEventListener('click', async function() {
+        if (autofillRunning) { setStatus('Autofill is still running - wait for it to finish.', true); return; }
         const rawData = inputBox.value.trim();
         if (!rawData) { alert('Please paste the data key.'); return; }
-        const data = rawData.split('|||').map(x => x.trim());
+        const { data, warning } = parseDataKey(rawData);
+        setStatus(warning || 'Filling...', !!warning);
 
-        if (location.pathname.toLowerCase().includes('/createjob.aspx')) {
-            await autofillCreateJob(data);
-        } else {
-            autofillWorkCenter(data);
+        autofillRunning = true;
+        btn.disabled = true;
+        btn.style.opacity = '0.6';
+        try {
+            if (location.pathname.toLowerCase().includes('/createjob.aspx')) {
+                await autofillCreateJob(data);
+            } else {
+                autofillWorkCenter(data);
+                await sleep(10000);   // WorkCenter fills on timers; hold the button so a second click can't double-fire them
+            }
+            setStatus((warning ? warning + ' ' : '') + 'Done - review the form before saving.', !!warning);
+        } catch (e) {
+            console.error('Autofill failed:', e);
+            setStatus('Autofill error: ' + (e && e.message ? e.message : e), true);
+        } finally {
+            autofillRunning = false;
+            btn.disabled = false;
+            btn.style.opacity = '';
         }
     });
+
+    // Console access for testing the parsers on this page: IntakeAutofillDebug.parseAddress("123 Main St Richmond VA 23220")
+    window.IntakeAutofillDebug = {
+        parseAddress, splitName, extractPhone, extractEmail, parseDataDate, excelDateToJSDate, parseDataKey, cleanValue,
+        resolveAddressPair, resolveFranchise, stateCandidates, matchSourceOfLoss, lookupByKeyword, lossTypeMap, divisionMap,
+        mapReportedBy, mapReportedByCreateJob, mapReferredBy, mapReferredByCreateJob, mapTPA,
+        matchWorkCenterCauseOfLoss, wcCauseListFor, WC_CAUSE_OF_LOSS
+    };
 })();
