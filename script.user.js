@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WorkCenter + CreateJob Intake Autofill
 // @namespace    http://tampermonkey.net/
-// @version      23.06
+// @version      23.07
 // @description  Combined autofill with load-on-demand RadComboBox support, Division checkboxes, Insurance Carrier, Claim/Policy, Loss Description, robust address/name/phone/date parsing
 // @updateURL    https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
 // @downloadURL  https://github.com/SBrowningSERVPRO/WCandDashAutofill/raw/main/script.user.js
@@ -13,7 +13,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = "23.05";   // keep in sync with @version above - shown in the panel header
+    const SCRIPT_VERSION = "23.07";   // keep in sync with @version above - shown in the panel header
 
     // ==========================================
     //  FIXED COLUMN INDICES (shared data key format)
@@ -245,6 +245,8 @@ async function findEstimatorMatch(scheduledPMRaw) {
         "bio hazard": { lossType: "Bio Hazard", secondary: "Bio Hazard Remediation" },
         "biohazard":  { lossType: "Bio Hazard", secondary: "Bio Hazard Remediation" },
         "reconstruction": { lossType: "Reconstruction", secondary: "Reconstruction" },
+        "duct cleaning":  { lossType: "Other", secondary: "Duct Cleaning" },
+        "duct":           { lossType: "Other", secondary: "Duct Cleaning" },
         // extra keywords matched as whole words inside the Type of Loss text ("Fire/Smoke", "Flood Damage", "Sewer Backup")
         "flood":      { lossType: "Water",      secondary: "Water Damage Remediation" },
         "sewer":      { lossType: "Water",      secondary: "Water Damage Remediation" },
@@ -1217,7 +1219,7 @@ function setPlainTextBox(id, value) {
         if (r.includes("property manager")) return "Property Manager";
         if (r.includes("relative") || r.includes("friend") || r.includes("neighbor") || r.includes("spouse") || r.includes("parent") || r.includes("child")) return "Relative, Friend or Neighbor";
         if (r.includes("marketing") || r.includes("sales")) return "Sales Marketing Representative ";
-        if (r.includes("servpro hq") || r.includes("hq")) return "SERVPRO HQ";
+        if (/\bhq\b|servpro\s*hq/.test(r)) return "SERVPRO HQ";
         if (r.includes("servpro franchise") || r.includes("franchise")) return "SERVPRO Franchise";
         if (r.includes("tenant") || r.includes("occupant")) return "Tenant";
 
@@ -1231,7 +1233,7 @@ function setPlainTextBox(id, value) {
         if (!refLower) return null;
         if (refLower.includes("servpro.com") || refLower.includes("servpro,com")) return "servpro.com";
         if (refLower.includes("google")) return "google";
-        if (refLower.includes("hq")) return "servpro hq";
+        if (/\bhq\b|servpro\s*hq/.test(refLower)) return "servpro hq";
         // Everything else -> no reliable contact match; leave blank / Other
         return null;
     }
@@ -1248,17 +1250,23 @@ function setPlainTextBox(id, value) {
         "Contractor Connection": "2843889"
     };
 
-    // Tolerant of spacing, punctuation and typos: "ContractorConnections", "West Hill", "Servpro,com Call", "servpro hq", "Alacraty"
+    // Tolerant of spacing, punctuation and typos: "ContractorConnections", "West Hill", "servpro hq", "Alacraty"
+    // servpro.com is NOT SERVPRO HQ: a servpro.com lead only sets Referred By, never the TPA Company.
     function mapTPA(referredByRaw, hqRefRaw) {
         const text = cleanValue(referredByRaw).toLowerCase();
         const squash = text.replace(/[^a-z0-9]/g, "");          // "contractor connections" -> "contractorconnections"
         if (/alacr/.test(squash)) return TPA_OPTIONS.ALACRITY;
         if (/westhil/.test(squash)) return TPA_OPTIONS.WESTHILL;
         if (/contractorcon|contractercon|crawford/.test(squash)) return TPA_OPTIONS.CC;
-        if (/servprocom|servprohq|headquarter|callcenter|priorityresponse|1800servpro|800servpro/.test(squash) || /\bhq\b|\bcorporate\b/.test(text)) return TPA_OPTIONS.HQ;
-        // A SERVPRO HQ reference number on the key also means HQ sent the job
+        // HQ tests run with any "servpro.com" mention removed, so a web lead can never read as HQ
+        const hqText = text.replace(/servpro\s*[.,]?\s*com\b/g, " ");
+        const hqSquash = hqText.replace(/[^a-z0-9]/g, "");
+        if (/servprohq|priorityresponse|1800servpro|800servpro/.test(hqSquash)
+            || /\bhq\b/.test(hqText)
+            || (/servpro/.test(hqSquash) && /headquarter|callcenter|corporate/.test(hqSquash))) return TPA_OPTIONS.HQ;
+        // The HQ reference column counts only when it holds an actual reference number (3+ digits) or an explicit yes
         const ref = cleanValue(hqRefRaw).toLowerCase();
-        if (ref && !/^(no|n|none|false|0)$/.test(ref)) return TPA_OPTIONS.HQ;
+        if (/\d{3,}/.test(ref) || /^(yes|y|true)$/.test(ref)) return TPA_OPTIONS.HQ;
         return null;
     }
 
@@ -1296,7 +1304,7 @@ function setPlainTextBox(id, value) {
 
         if (refLower.includes("marketing rep")) {
             referredBy = "Advertising - Other";
-        } else if (refLower.includes("hq") || refLower.includes("servpro hq")) {
+        } else if (/\bhq\b|servpro\s*hq/.test(refLower)) {
             referredBy = "SERVPRO® Franchise Referral";
         } else if (/servpro[.,]com|google|chatgpt|\bbing\b|yahoo|duckduckgo|\bweb\s*site\b|website|\bsearch\b|\bonline\b|internet|\byelp\b|nextdoor|\bangi\b|facebook|\bgemini\b|copilot|\bsiri\b|\balexa\b/.test(refLower)) {
             referredBy = "Internet/Web Search";
@@ -2419,7 +2427,7 @@ if (scheduledPM !== "**NOT ASSIGNED**") {
 
         // 9b. TPA Company (Alacrity / Westhill / SERVPRO HQ / Contractor Connection) from "How did you hear about SERVPRO?"
         const tpa = mapTPA(referredByRaw, data[COLUMN.ServproHQRef]);
-        console.log("TPA Company:", referredByRaw, "->", tpa);
+        console.log("TPA Company:", referredByRaw, "| HQ ref:", data[COLUMN.ServproHQRef], "->", tpa);
         if (tpa) await fillTPACompany(tpa);
 
         // 10. Policy Information: ONLY Claim Number + Policy Number
